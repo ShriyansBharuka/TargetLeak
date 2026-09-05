@@ -253,19 +253,30 @@ def _oof_target_encode(col, y, folds=FOLDS, seed=0):
     In-fold encoding leaks the target into its own score, which would make
     every high-cardinality column look catastrophic. Out-of-fold is the whole
     reason this tool can tell a real leak from a legitimate feature.
+
+    Factorised once up front, so the fold loop groups integer codes instead of
+    Python objects. pandas' own group_mean still does the summing, so the
+    floats are bit-identical to grouping the values themselves.
     """
-    y = pd.Series(np.asarray(y), index=col.index).astype(float)
+    yv = np.asarray(y, dtype=float)
     rng = np.random.default_rng(seed)
-    fold = pd.Series(rng.permutation(len(col)) % folds, index=col.index)
-    out = pd.Series(np.nan, index=col.index, dtype=float)
-    for f in range(folds):
-        tr, te = fold != f, fold == f
-        means = y[tr].groupby(col[tr], observed=True).mean()
-        out[te] = col[te].map(means).astype(float)
-    return out.fillna(y.mean())
+    fold = rng.permutation(len(col)) % folds
+    codes, _ = pd.factorize(col, use_na_sentinel=True)
+    ncat = int(codes.max()) + 1 if len(codes) else 0
+    out = np.full(len(col), np.nan)
+    ys = pd.Series(yv)
+    known = codes >= 0
+    for f in range(folds if ncat else 0):
+        tr = known & (fold != f)
+        means = ys[tr].groupby(codes[tr], sort=False).mean()
+        lut = np.full(ncat, np.nan)
+        lut[means.index.to_numpy()] = means.to_numpy()
+        te = known & (fold == f)
+        out[te] = lut[codes[te]]
+    return pd.Series(out, index=col.index).fillna(ys.mean())
 
 
-def _score_column(col, y, kind, n_features=1):
+def _score_column(col, y, kind, n_features=1, n_unique=None):
     """Measure one column against the target.
 
     Returns None when unscoreable, else a dict:
@@ -275,7 +286,7 @@ def _score_column(col, y, kind, n_features=1):
       z        standard errors above the null - guards against small samples
       z_min    the bar `z` had to clear
     """
-    if col.nunique(dropna=True) < 2:
+    if (col.nunique(dropna=True) if n_unique is None else n_unique) < 2:
         return None
     zmin = _z_min(n_features)
 
@@ -297,7 +308,7 @@ def _score_column(col, y, kind, n_features=1):
             # distinct, so target encoding returns the global mean and scores
             # 0.5 - a date that ranks perfectly with the target read as noise.
             return [col.astype("int64")]
-        enc = _oof_target_encode(col.astype("object"), target_vec)
+        enc = _oof_target_encode(col, target_vec)
         if pd.api.types.is_numeric_dtype(col):
             return [col, enc]
         return [enc]
@@ -448,13 +459,13 @@ def _suspicious_name(name, target=None):
     return None
 
 
-def _looks_like_id(col):
+def _looks_like_id(col, n_unique=None):
     """Identifiers are strings or integer codes -- never continuous floats.
 
     A float measurement is ~100% unique by nature, so a bare uniqueness test
     labels every real numeric feature an ID and skips the columns that matter.
     """
-    n = col.nunique(dropna=True)
+    n = col.nunique(dropna=True) if n_unique is None else n_unique
     if n <= 50 or len(col) == 0 or n / len(col) <= ID_UNIQUE_RATIO:
         return False
     if pd.api.types.is_float_dtype(col) or _is_timelike(col):
@@ -583,8 +594,13 @@ def _evidence_pure(col, y, limit=5):
 
 def _category_purity(col, y):
     """Largest share of rows sitting in perfectly-pure, well-supported categories."""
-    yb = pd.Series(np.asarray(y), index=col.index)
-    g = yb.groupby(col.astype("object"), observed=True).agg(["count", "nunique"])
+    yb = pd.Series(np.asarray(y))
+    # Group the integer codes, not the values: identical grouping (factorize
+    # and groupby agree on dropping nulls) without materialising a whole
+    # column of Python objects, which costs more than the grouping itself.
+    codes, _ = pd.factorize(col, use_na_sentinel=True)
+    keep = codes >= 0
+    g = yb[keep].groupby(codes[keep], sort=False).agg(["count", "nunique"])
     pure = g[(g["count"] >= MIN_CATEGORY_SUPPORT) & (g["nunique"] == 1)]
     return float(pure["count"].sum() / len(col)) if len(col) else 0.0
 
@@ -664,15 +680,24 @@ def analyse(df, target, split=None, group=None, ignore=()):
     # an upstream job that never reached the training set. On real data that
     # was 17 features, including an entire ingestion pipeline, and it was
     # filed as a bare "no information" note.
-    varies_in_file = {c for c in features
-                      if _safe_nunique(df[c]) > 1}
     labelled = y.notna()
+    all_labelled = bool(labelled.all())
+    # Only worth a second full pass when some rows are unlabelled. If every row
+    # has a target then "varies in the file" and "varies on the labelled rows"
+    # are the same question, and the per-column loop below already answers it.
+    varies_in_file = set() if all_labelled else {
+        c for c in features if _safe_nunique(df[c]) > 1}
     if int(labelled.sum()) < 20:
         raise ValueError(
             f"only {int(labelled.sum())} rows have a target value - too few to "
             "assess. Check you named the right column.")
-    df = df.loc[labelled]
-    y = y.loc[labelled]
+    if not all_labelled:
+        # Worth almost nothing on pandas 3, where copy-on-write makes an
+        # all-True .loc a lazy view (measured: +0 MB). Kept because pyproject
+        # still supports pandas 2.x, where it is a real copy of the whole
+        # table. The saving in this branch is the skipped pass above, not this.
+        df = df.loc[labelled]
+        y = y.loc[labelled]
 
     # --- names that give a column away regardless of its score -----------
     for c in scored_features:
@@ -744,7 +769,7 @@ def _column_findings(c, col, y, kind, n_features=1, varied_in_file=False):
     binary = kind == "binary"
     findings = []
     n_unique = col.nunique(dropna=True)
-    if _looks_like_id(col):
+    if _looks_like_id(col, n_unique):
         findings.append(Finding(
             "warning", "identifier-like", c,
             f"{n_unique:,} distinct values in {len(col):,} rows "
@@ -802,7 +827,7 @@ def _column_findings(c, col, y, kind, n_features=1, varied_in_file=False):
                 "carries the answer even if the values do not.",
                 _evidence_missing(col, y, binary)))
 
-    m = _score_column(col, y, kind, n_features)
+    m = _score_column(col, y, kind, n_features, n_unique)
     if m is None:
         if varied_in_file:
             findings.append(Finding(
@@ -867,7 +892,7 @@ def _column_findings(c, col, y, kind, n_features=1, varied_in_file=False):
             scored(_evidence(col, y, binary))))
 
     if not pd.api.types.is_numeric_dtype(col) or _looks_categorical(col):
-        purity = _category_purity(col.astype("object"), y)
+        purity = _category_purity(col, y)
         if purity >= 0.5 and score >= AUC_WARN and z >= z_min:
             findings.append(Finding(
                 "critical", "pure-categories", c,
@@ -885,7 +910,9 @@ def _is_timelike(col):
     # `dtype != object` here silently skipped every date loaded from a CSV.
     if pd.api.types.is_numeric_dtype(col) or pd.api.types.is_bool_dtype(col):
         return False
-    sample = col.dropna().astype(str).head(50)
+    # head(50) BEFORE the cast, not after: astype(str) on a full object column
+    # is a per-row Python call and 49,950 of them were being thrown away.
+    sample = col.dropna().head(50).astype(str)
     if sample.empty:
         return False
     try:  # pandas 3 warns rather than raises on unparseable input
@@ -915,7 +942,10 @@ def _split_checks(df, target, split, features, group):
         try:
             ha = pd.util.hash_pandas_object(a[feat], index=False)
             hb = pd.util.hash_pandas_object(b[feat], index=False)
-            shared = int(hb.isin(set(ha.to_numpy())).sum())
+            # isin() against the Series, never set(...): a Python set of n
+            # hashes costs ~70 bytes a row and reintroduces the per-row-object
+            # blow-up the hashing exists to avoid. pandas matches in C.
+            shared = int(hb.isin(ha).sum())
         except TypeError:
             return out  # unhashable cell values; nothing to compare
         if shared:
