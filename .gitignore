@@ -16,3 +16,4 @@ _private/
 # Local editor/agent settings, personal to one machine.
 .claude/
 .playwright-mcp/
+graphify-out/
