@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Local revenue ledger -- real financial data, never commit it.
+ledger.db
+
+# Personal revenue ledger and notes - not part of the OSS package.
+_private/
+
+# Local editor/agent settings, personal to one machine.
+.claude/
+.playwright-mcp/

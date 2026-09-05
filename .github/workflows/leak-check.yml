@@ -1,0 +1,105 @@
+# Reusable example: run targetleak on every PR that touches the data, and
+# comment the findings on the PR. Copy this into your own repo.
+#
+# Nothing is uploaded anywhere. The check runs on your runner, against your
+# data, and only the findings reach the PR comment -- which matters, because
+# training data is usually the thing you are least allowed to send outside.
+name: leak-check
+
+on:
+  pull_request:
+    paths:
+      - "data/**"
+      - "**/*.csv"
+      - "**/*.parquet"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  leak-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install "targetleak[parquet]"
+
+      - name: Check for leakage
+        id: check
+        continue-on-error: true       # comment first, fail the job after
+        run: |
+          targetleak data/train.csv --target "${{ vars.TARGET_COLUMN || 'y' }}" \
+            --json > findings.json
+          targetleak data/train.csv --target "${{ vars.TARGET_COLUMN || 'y' }}" \
+            --html report.html
+
+      - name: Upload the HTML report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: leak-report
+          path: report.html
+
+      - name: Build the comment
+        if: always()
+        run: |
+          python - <<'PY' > comment.md
+          import json, pathlib
+          d = json.loads(pathlib.Path("findings.json").read_text())
+          crit = [f for f in d["findings"] if f["severity"] == "critical"]
+          warn = [f for f in d["findings"] if f["severity"] == "warning"]
+          out = ["## targetleak", ""]
+          if crit:
+              out.append(f"**{len(crit)} critical finding(s).** "
+                         "Do not trust this model's test score until resolved.")
+          elif warn:
+              out.append(f"No certain leak. {len(warn)} thing(s) to confirm.")
+          else:
+              out.append("No leakage detected by these checks.")
+          if crit or warn:
+              out += ["", "| | column | finding |", "|---|---|---|"]
+              icon = {"critical": "🛑", "warning": "⚠️"}
+              for f in crit + warn:
+                  col = f"`{f['column']}`" if f["column"] else "-"
+                  out.append(f"| {icon[f['severity']]} | {col} | "
+                             f"{f['kind']}: {f['detail']} |")
+          if d.get("fix_code"):
+              out += ["", "<details><summary>Remediation code</summary>", "",
+                      "```python", d["fix_code"], "```", "", "</details>"]
+          out += ["", "_Full HTML report is in this run's artifacts._"]
+          print("\n".join(out))
+          PY
+
+      - name: Comment on the PR
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('comment.md', 'utf8');
+            const {owner, repo} = context.repo;
+            const issue_number = context.issue.number;
+            // Update one comment in place instead of adding a new one each push.
+            const marker = '## targetleak';
+            const existing = await github.paginate(
+              github.rest.issues.listComments, {owner, repo, issue_number});
+            const mine = existing.find(c =>
+              c.user.type === 'Bot' && c.body.startsWith(marker));
+            if (mine) {
+              await github.rest.issues.updateComment(
+                {owner, repo, comment_id: mine.id, body});
+            } else {
+              await github.rest.issues.createComment(
+                {owner, repo, issue_number, body});
+            }
+
+      - name: Fail if anything critical was found
+        if: steps.check.outcome == 'failure'
+        run: |
+          echo "targetleak found critical issues - see the PR comment."
+          exit 1
