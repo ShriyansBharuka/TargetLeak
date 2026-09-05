@@ -914,3 +914,88 @@ def test_benchmark_leak_kinds_match_the_report():
     the other silently degrades both."""
     bench = _load_benchmark()
     assert bench.LEAK_KINDS <= set(tl.FIXES), bench.LEAK_KINDS - set(tl.FIXES)
+
+
+# --- methodology: the two findings the audits raised and I had not fixed -----
+
+@pytest.mark.parametrize("share", [0.50, 0.20, 0.05, 0.02])
+def test_a_flag_marking_the_top_of_a_continuous_target_is_caught(share):
+    """|Spearman| for a two-group predictor is capped at sqrt(3)/2 = 0.866 at
+    an even split and collapses as the split skews, so a flag that perfectly
+    identified the top 2% of a revenue target scored 0.62 - noise - while the
+    identical data against a binary target scored AUC 1.0000. Binary flags,
+    low-cardinality codes and missingness indicators were getting a free pass
+    purely because the target happened to be a number."""
+    rng = np.random.default_rng(0)
+    n = 6000
+    revenue = rng.lognormal(3, 1, n)
+    flag = np.zeros(n)
+    flag[np.argsort(-revenue)[:int(n * share)]] = 1.0
+    m = tl._score_column(pd.Series(flag), pd.Series(revenue), "continuous")
+    assert m["score"] >= tl.AUC_CRITICAL, f"top {share:.0%} flag scored {m}"
+    crit = {f.column for f in tl.analyse(
+        pd.DataFrame({"flag": flag, "noise": rng.normal(size=n),
+                      "rev": revenue}), "rev") if f.severity == "critical"}
+    assert "flag" in crit and "noise" not in crit
+
+
+def test_an_unrelated_discrete_column_stays_quiet_against_a_continuous_target():
+    rng = np.random.default_rng(1)
+    n = 6000
+    rev = rng.lognormal(3, 1, n)
+    df = pd.DataFrame({"grp": rng.integers(0, 5, n), "rev": rev})
+    assert tl._score_column(df["grp"], df["rev"], "continuous")["score"] < tl.AUC_WARN
+
+
+def test_a_continuous_predictor_still_uses_spearman():
+    rng = np.random.default_rng(2)
+    n = 4000
+    rev = rng.lognormal(3, 1, n)
+    m = tl._score_column(pd.Series(rev * 2 + rng.normal(0, 1, n)),
+                         pd.Series(rev), "continuous")
+    assert "Spearman" in m["metric"] and m["score"] > tl.AUC_CRITICAL
+
+
+def test_encoded_columns_get_a_measured_null_not_an_assumed_one():
+    """Hanley-McNeil assumes the scores were fixed before the target was seen.
+    Out-of-fold encoding removes the within-fold leak but not the between-fold
+    one, so on 600 null draws a four-category noise column cleared the 3.5 bar
+    3.7% of the time against a nominal 0.05% - about 70x. The score gate was
+    masking it, but the z is reported to users and gates the `underpowered`
+    downgrade, so it has to mean what it says."""
+    rng = np.random.default_rng(0)
+    n = 3000
+    code = rng.integers(0, 12, n)
+    y = pd.Series(np.isin(code, [3, 7]).astype(int))
+    col = pd.Series([f"R{c:02d}" for c in code])
+    m = tl._score_column(col, y, "binary")
+    analytic = (m["score"] - 0.5) / tl._null_se(int(y.sum()), int((y == 0).sum()))
+    # Measured, so it must differ from the analytic figure - and be lower,
+    # because the encoded null sits above chance rather than at it.
+    assert m["z"] != pytest.approx(analytic, rel=1e-6)
+    assert m["z"] < analytic
+    assert m["z"] >= m["z_min"], "a real leak must still clear the bar"
+
+
+def test_numeric_columns_keep_the_analytic_null():
+    """Hanley-McNeil is valid when the scores were not built from the target,
+    and the permutation cost must not be paid for every column."""
+    rng = np.random.default_rng(3)
+    n = 2000
+    y = pd.Series(rng.integers(0, 2, n))
+    col = pd.Series(y.to_numpy() * 40.0 + rng.normal(0, 0.5, n))
+    m = tl._score_column(col, y, "binary")
+    expected = (m["score"] - 0.5) / tl._null_se(int(y.sum()), int((y == 0).sum()))
+    assert m["z"] == pytest.approx(expected, rel=1e-9)
+
+
+def test_noise_categoricals_produce_nothing_end_to_end():
+    rng = np.random.default_rng(4)
+    for n in (300, 1500):
+        data = {f"c{i}": rng.choice(list("abcdefgh"), n) for i in range(60)}
+        data["y"] = rng.integers(0, 2, n)
+        loud = [f.column for f in tl.analyse(pd.DataFrame(data), "y")
+                if f.severity in ("critical", "warning")
+                and f.kind in ("target-proxy", "suspiciously-predictive",
+                               "pure-categories")]
+        assert not loud, f"n={n}: {loud}"

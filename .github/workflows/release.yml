@@ -1,0 +1,96 @@
+# Publish to PyPI when a version tag is pushed.
+#
+# Uses PyPI Trusted Publishing (OIDC): GitHub proves this workflow's identity
+# to PyPI directly, so there is no API token to create, paste into a secret,
+# rotate, or leak. Nothing sensitive is stored in this repository.
+#
+# ONE-TIME SETUP on PyPI, before the first tag:
+#   1. pypi.org -> Your projects -> Publishing -> "Add a new pending publisher"
+#      (a "pending" publisher is how you claim a name that has no release yet)
+#   2. Fill in exactly:
+#        PyPI project name : targetleak
+#        Owner             : ShriyansBharuka
+#        Repository name   : TargetLeak
+#        Workflow filename : release.yml
+#        Environment name  : pypi
+#   3. In this repo: Settings -> Environments -> New environment -> "pypi".
+#      Optionally add yourself as a required reviewer, which makes every
+#      publish pause for a manual approval - worth it, because a version
+#      number on PyPI can never be reused or overwritten.
+#
+# To release:  git tag -a v0.1.1 -m "0.1.1" && git push origin v0.1.1
+#
+# The tag must match the version in pyproject.toml; the check-version job
+# below fails the release rather than publishing a mislabelled artifact.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check the tag matches the packaged version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os, re, pathlib
+          tag = os.environ["TAG"].lstrip("v")
+          src = pathlib.Path("targetleak/__init__.py").read_text(encoding="utf-8")
+          mod = re.search(r'__version__ = "([^"]+)"', src).group(1)
+          proj = re.search(r'^version = "([^"]+)"',
+                           pathlib.Path("pyproject.toml").read_text(encoding="utf-8"),
+                           re.M).group(1)
+          print(f"tag={tag} pyproject={proj} module={mod}")
+          assert tag == proj == mod, (
+              "tag, pyproject version and __version__ must all agree - "
+              "a PyPI version can never be reused, so this is not recoverable")
+          PY
+
+      - name: Build and verify
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m build
+          python -m twine check dist/*
+
+      - name: Install the built wheel and smoke-test it
+        # Publishing an artifact nobody has run is how a broken release ships.
+        run: |
+          python -m venv /tmp/probe
+          /tmp/probe/bin/pip install -q dist/*.whl
+          set +e
+          /tmp/probe/bin/targetleak --demo > /dev/null
+          rc=$?
+          set -e
+          test "$rc" -eq 1 || { echo "expected exit 1, got $rc"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi          # must match the trusted publisher above
+    permissions:
+      id-token: write          # required for OIDC; without it the upload 403s
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        # No `password:` on purpose - that is the whole point of OIDC.

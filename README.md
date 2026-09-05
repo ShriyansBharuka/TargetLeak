@@ -119,6 +119,13 @@ errors, with the bar rising as more columns are tested. Without that, 60
 columns of pure noise on 20 rows produce a "critical leak" - the threshold
 alone has no idea how much data it is looking at.
 
+For a raw column that null is analytic (Hanley-McNeil). For a target-encoded
+one it is **measured**, by permuting the target and re-encoding, because an
+encoding built from the target is not independent of it - assuming otherwise
+made a four-category noise column clear the bar 3.7% of the time against a
+nominal 0.05%. The permutations run only for columns that already cleared the
+score threshold, so the cost is per candidate, not per column.
+
 ## Two details that make it work
 
 **Categoricals are scored with out-of-fold target encoding.** Encode in-fold
@@ -200,6 +207,11 @@ in what reached the model.
   That lives in your code, not your data — read your pipeline.
 - A `suspiciously-predictive` finding is not proof. Some features really are
   that good. It tells you where to look.
+- A discrete predictor against a continuous target is scored by how well the
+  target separates each of its groups, not by correlation. |Spearman| for a
+  two-group predictor is capped at 0.866 at an even split and collapses from
+  there, so a flag identifying the top 2% of a revenue target used to score
+  0.62 and read as noise.
 - The power gate is a Bonferroni-flavoured approximation, not an exact test.
   It is there to stop small samples producing confident nonsense, and it will
   occasionally hold back a real finding on a small dataset - which is reported

@@ -47,6 +47,10 @@ ID_UNIQUE_RATIO = 0.95
 # one row is trivially "pure" and means nothing.
 MIN_CATEGORY_SUPPORT = 20
 FOLDS = 5
+# Permutations used to measure the null for target-encoded columns, where the
+# analytic SE does not apply. Only spent on columns that already cleared the
+# score threshold, so this is per-candidate, not per-column.
+PERMUTATIONS = 60
 
 
 # Finding a leak is half the job. Naming the leak without saying what to do
@@ -226,6 +230,32 @@ def _z_min(n_features):
     return Z_MAX
 
 
+def _empirical_z(observed, resample, k=PERMUTATIONS, floor=1e-9):
+    """Standard errors above a null estimated by permutation.
+
+    The Hanley-McNeil SE assumes the score vector was fixed before the target
+    was seen. That is true of a raw column and false of a target-encoded one:
+    out-of-fold encoding removes the within-fold leak but not the between-fold
+    one, so the encoded column stays correlated with the target even under the
+    null. Measured on 600 null draws at n=1000, the analytic z was badly
+    over-dispersed - a four-category column of pure noise cleared the 3.5 bar
+    3.7% of the time against a nominal 0.05%, roughly 70x.
+
+    So for encoded columns the null is measured instead of assumed: shuffle
+    the target, re-encode against the shuffled copy, re-score, and read the
+    observed value against that distribution. Only run for columns that have
+    already cleared the score threshold, which is a handful per dataset, so
+    the cost is bounded by the number of real candidates rather than by the
+    width of the frame.
+    """
+    sims = np.array([resample(i) for i in range(k)], dtype=float)
+    sims = sims[np.isfinite(sims)]
+    if len(sims) < 5:
+        return 0.0
+    sd = float(sims.std(ddof=1))
+    return float((observed - sims.mean()) / max(sd, floor))
+
+
 def _target_kind(y):
     """binary | multiclass | continuous | degenerate | unsupported.
 
@@ -300,17 +330,21 @@ def _score_column(col, y, kind, n_features=1, n_unique=None):
         at 2,000, and caught as strings but missed as the integers read_csv
         actually gives you. Try both and keep the stronger: a tree model
         would happily use either.
+
+        Each entry is (vector, built_from_the_target). The flag matters
+        because an encoding built from the target invalidates the analytic
+        null SE, so the winner has to say how it was made.
         """
         if pd.api.types.is_float_dtype(col):
-            return [col]                      # encoding a float is meaningless
+            return [(col, False)]             # encoding a float is meaningless
         if pd.api.types.is_datetime64_any_dtype(col):
             # Order is the whole signal in a timestamp, and every value is
             # distinct, so target encoding returns the global mean and scores
             # 0.5 - a date that ranks perfectly with the target read as noise.
-            return [col.astype("int64")]
-        enc = _oof_target_encode(col, target_vec)
+            return [(col.astype("int64"), False)]
+        enc = (_oof_target_encode(col, target_vec), True)
         if pd.api.types.is_numeric_dtype(col):
-            return [col, enc]
+            return [(col, False), enc]
         return [enc]
 
     def measure(target_ind):
@@ -323,16 +357,30 @@ def _score_column(col, y, kind, n_features=1, n_unique=None):
         chance", which is the opposite of what the power gate exists for.
         """
         best_auc, best_sep, best_se = 0.5, 0.5, float("inf")
-        for scores in candidates(target_ind):
+        best_encoded = False
+        for scores, encoded in candidates(target_ind):
             ok = pd.Series(scores).notna().to_numpy()
             used = np.asarray(target_ind)[ok]
             auc = _auc(scores, target_ind)
             sep = _separation(auc)
             if sep >= best_sep:
-                best_auc, best_sep = auc, sep
+                best_auc, best_sep, best_encoded = auc, sep, encoded
                 best_se = _null_se(int((used == 1).sum()),
                                    int((used == 0).sum()))
         z = (best_sep - 0.5) / best_se if best_se not in (0, float("inf")) else 0.0
+
+        if best_encoded and best_sep >= AUC_WARN:
+            # The analytic SE assumes the scores were fixed before the target
+            # was seen, which is false for an encoding built from it. Measure
+            # the null instead - only for a column that already cleared the
+            # score bar, so this is spent per candidate, not per column.
+            ind = np.asarray(target_ind)
+
+            def null_score(i):
+                perm = np.random.default_rng(i).permutation(ind)
+                return _separation(_auc(_oof_target_encode(col, perm), perm))
+
+            z = _empirical_z(best_sep, null_score)
         return best_auc, best_sep, z
 
     if kind == "binary":
@@ -361,23 +409,69 @@ def _score_column(col, y, kind, n_features=1, n_unique=None):
 
     if kind == "continuous":
         yy = pd.Series(np.asarray(y), index=col.index)
-        best_r, n = None, 0
-        for s in candidates(np.asarray(y)):
+
+        # A DISCRETE predictor against a continuous target must not be scored
+        # with a correlation. |Spearman| for a two-group predictor is capped at
+        # sqrt(3)/2 = 0.866 at an even split and collapses as the split skews,
+        # so a flag that perfectly identifies the top 2% of a revenue target
+        # scored 0.62 - indistinguishable from noise, while the identical data
+        # against a binary target scored AUC 1.0000. Whole classes of leak
+        # (binary flags, low-cardinality codes, missingness indicators) were
+        # getting a free pass purely because the target was a number.
+        #
+        # So swap the roles: ask how well the target separates each of the
+        # predictor's groups from the rest. That is an ordinary AUC, it reaches
+        # 1.0 exactly when a group occupies one end of the target's range, and
+        # it lands on the same [0.5, 1] axis as every other check. The groups
+        # are not derived from y, so the Hanley-McNeil null SE is valid here.
+        n_vals = int(col.nunique(dropna=True)) if n_unique is None else n_unique
+        if n_vals <= MAX_CLASSES:
+            best, best_z, best_lab = 0.5, 0.0, None
+            for val in sorted(col.dropna().unique(), key=repr):
+                ind = (col == val).to_numpy().astype(int)
+                sep = _separation(_auc(yy, ind))
+                if sep > best:
+                    se = _null_se(int(ind.sum()), int((ind == 0).sum()))
+                    best, best_lab = sep, val
+                    best_z = (sep - 0.5) / se if se else 0.0
+            if best_lab is None:
+                return None
+            return {"score": best, "auc": None,
+                    "metric": f"target separation for {_plain(best_lab)!r}",
+                    "z": best_z, "z_min": zmin}
+
+        best_r, n, best_encoded = None, 0, False
+        for s, encoded in candidates(np.asarray(y)):
             rho = pd.Series(s).corr(yy, method="spearman")
             if pd.isna(rho):
                 continue
             if best_r is None or abs(float(rho)) > abs(best_r):
-                best_r = float(rho)
+                best_r, best_encoded = float(rho), encoded
                 n = int(min(pd.Series(s).notna().sum(), yy.notna().sum()))
         if best_r is None:
             return None
-        rho = best_r
         # Fisher z for Spearman, mapped onto the same [0.5, 1] axis as AUC so
-        # one set of thresholds covers both problem types.
-        r = min(abs(float(rho)), 0.999999)
-        z = (0.5 * np.log((1 + r) / (1 - r)) * np.sqrt(max(n - 3, 1))
+        # one set of thresholds covers both problem types. The 1.06 is
+        # Spearman's variance inflation over Pearson's 1/(n-3).
+        r = min(abs(best_r), 0.999999)
+        score = 0.5 + r / 2
+        z = (0.5 * np.log((1 + r) / (1 - r)) * np.sqrt(max(n - 3, 1) / 1.06)
              if n > 3 else 0.0)
-        return {"score": 0.5 + r / 2, "auc": None,
+        if best_encoded and score >= AUC_WARN:
+            # Same reason as the binary path: Fisher-z assumes the predictor
+            # was not built from the target.
+            yv = np.asarray(y)
+
+            def null_rho(i):
+                perm = np.random.default_rng(i).permutation(yv)
+                enc = _oof_target_encode(col, perm)
+                rr = pd.Series(enc).corr(pd.Series(perm, index=col.index),
+                                         method="spearman")
+                return 0.5 + min(abs(float(rr)), 0.999999) / 2 \
+                    if pd.notna(rr) else np.nan
+
+            z = _empirical_z(score, null_rho)
+        return {"score": score, "auc": None,
                 "metric": "|Spearman| (scaled)", "z": float(z), "z_min": zmin}
 
     return None
