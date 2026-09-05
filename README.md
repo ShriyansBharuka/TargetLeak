@@ -129,6 +129,47 @@ on. No AUC threshold can catch that; the column's name gives it away. Found on
 real data where seven `label_*` columns sat in the feature matrix scoring only
 0.60–0.76 — invisible to statistics, obvious from their names.
 
+## Benchmark
+
+Synthetic tests where the same author writes both the leak and the detector
+prove nothing. This runs against data nobody here constructed:
+
+```bash
+python benchmark/run_benchmark.py
+```
+
+| dataset | rows | cols | known leaks | found | false positives |
+|---|---:|---:|---|---|---:|
+| titanic | 1,309 | 13 | `boat`, `body` | `boat`, `body` | 0 |
+| iris | 150 | 4 | - | - | 2 |
+| wine | 178 | 13 | - | - | 3 |
+| breast_cancer | 569 | 30 | - | - | 0 |
+| digits | 1,797 | 64 | - | - | 0 |
+| diabetes | 442 | 10 | - | - | 0 |
+
+**Recall on documented leaks: 2/2. False positives on clean data: 5 across 121
+columns in 5 datasets.**
+
+Titanic's `boat` and `body` are the textbook leakage example — a lifeboat
+number exists only for people who got into a lifeboat, a body-recovery number
+only for people who did not survive. The other five ship with scikit-learn and
+are among the most-studied datasets in the field; if they leaked, it would be
+famous. Every critical finding there is counted against the tool.
+
+**The five false positives are real and are not going to be tuned away.** On
+iris, `petal length` gives AUC 1.0 against setosa. That is identical in every
+measurable respect to a leak — the difference is that iris is genuinely an easy
+problem, and no statistic can see the difference. It is the tool's central
+limitation, so the benchmark counts it as a failure rather than explaining it
+away, and a critical finding is worded to name both possibilities.
+
+The benchmark also earned its place immediately: it caught a miss on `body`.
+That column identifies only 121 of 1,309 passengers, so its missingness AUC is
+0.575 and the ranking check walked straight past it — even though every one of
+those 121 died. A column can give the answer away on a subset of rows while
+looking like noise overall, and that check now exists because a dataset we did
+not write exposed its absence.
+
 ## A real find
 
 One dataset is not a validation set, and this one is the author's own project

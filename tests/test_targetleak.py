@@ -355,6 +355,41 @@ def test_missingness_can_be_the_leak():
     assert hits[0].severity == "critical"
 
 
+def test_leak_that_only_covers_a_subset_of_rows():
+    """The Titanic `body` column: a body-recovery number exists for 121 of
+    1,309 passengers, every one of whom died. Its missingness AUC is 0.575 -
+    ranking metrics are blind to a column that is perfectly predictive on a
+    small subset, and the benchmark caught this as a miss on a documented leak.
+    """
+    rng = np.random.default_rng(31)
+    n = 1300
+    y = (rng.random(n) > 0.38).astype(int)          # ~62% class 1
+    body = np.full(n, np.nan)
+    dead = np.flatnonzero(y == 0)[:121]
+    body[dead] = rng.normal(size=len(dead))          # only ever for class 0
+    df = pd.DataFrame({"body": body, "fare": rng.normal(size=n), "y": y})
+
+    # The overall ranking signal really is weak - that is the whole point.
+    weak = tl._score_column(pd.Series(body).isna().astype(int), df["y"], "binary")
+    assert weak["score"] < tl.AUC_WARN, weak
+
+    hits = [f for f in tl.analyse(df, "y") if f.kind == "missingness-leak"]
+    assert hits and hits[0].column == "body"
+    assert hits[0].severity == "critical"
+    assert "always" in hits[0].detail
+
+
+def test_subset_rule_needs_real_support():
+    """Three rows that happen to share a target value are not a leak."""
+    rng = np.random.default_rng(32)
+    n = 500
+    y = rng.integers(0, 2, n)
+    col = np.full(n, np.nan)
+    col[np.flatnonzero(y == 1)[:3]] = 1.0
+    df = pd.DataFrame({"sparse": col, "ok": rng.normal(size=n), "y": y})
+    assert not [f for f in tl.analyse(df, "y") if f.kind == "missingness-leak"]
+
+
 def test_harmless_missingness_is_not_flagged():
     rng = np.random.default_rng(7)
     n = 800

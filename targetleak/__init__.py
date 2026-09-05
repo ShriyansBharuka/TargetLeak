@@ -710,8 +710,29 @@ def _column_findings(c, col, y, kind, n_features=1, varied_in_file=False):
     # leaks entirely through its NaN pattern.
     na_share = float(col.isna().mean())
     if 0.01 < na_share < 0.99:
+        # A column can be perfectly predictive on a SUBSET of rows and still
+        # score near chance overall. The Titanic `body` column - a body
+        # recovery number - is present for 121 people, every one of whom died,
+        # yet its missingness AUC is only 0.575 because it says nothing about
+        # the other 1,188. Ranking metrics are blind to this; asking whether
+        # either group has a single target value is not.
+        for present in (True, False):
+            grp = y[col.isna() != present]
+            if len(grp) >= MIN_CATEGORY_SUPPORT and grp.nunique() == 1 \
+                    and pd.Series(y).nunique() > 1:
+                state = "present" if present else "missing"
+                findings.append(Finding(
+                    "critical", "missingness-leak", c,
+                    f"wherever this column is {state} ({len(grp):,} rows) the "
+                    f"target is always {grp.iloc[0]!r}. It does not have to "
+                    "predict every row to give the answer away on the rows it "
+                    "does cover.",
+                    _evidence_missing(col, y, binary)))
+                break
+
         na = _score_column(col.isna().astype(int), y, kind, n_features)
-        if na and na["score"] >= AUC_WARN and na["z"] >= na["z_min"]:
+        if na and na["score"] >= AUC_WARN and na["z"] >= na["z_min"] \
+                and not any(f.kind == "missingness-leak" for f in findings):
             sev = "critical" if na["score"] >= AUC_CRITICAL else "warning"
             findings.append(Finding(
                 sev, "missingness-leak", c,
@@ -771,9 +792,11 @@ def _column_findings(c, col, y, kind, n_features=1, varied_in_file=False):
     elif score >= AUC_CRITICAL:
         findings.append(Finding(
             "critical", "target-proxy", c,
-            f"alone {strength}. One column should not nearly solve the "
-            "target - this is very likely computed from the answer, or "
-            "recorded after it was known.",
+            f"alone {strength}. One column solving the target means one of two "
+            "things: it was computed from the answer or recorded after it was "
+            "known, or the problem really is this easy. Measurement cannot "
+            "tell those apart - check when this value is written, and whether "
+            "it exists unchanged at the moment you predict.",
             scored(_evidence(col, y, binary))))
     else:
         findings.append(Finding(
