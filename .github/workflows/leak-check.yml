@@ -41,9 +41,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      # Pin the version. This job holds a write token; an unpinned install runs
-      # whatever setup code the next release ships.
-      - run: pip install "targetleak[parquet]==0.1.0"
+      # Pin it. This job holds a write token; an unpinned install runs whatever
+      # setup code the next release ships. Once this is on PyPI, prefer
+      # `pip install "targetleak[parquet]==0.1.0"` over a git ref.
+      - run: |
+          pip install "targetleak[parquet] @ git+https://github.com/ShriyansBharuka/TargetLeak@v0.1.0"
 
       - name: Check for leakage
         id: check

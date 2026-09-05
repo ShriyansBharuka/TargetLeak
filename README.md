@@ -6,9 +6,12 @@
 carrying the answer — before you ship a model whose test score was never real.
 
 ```bash
-pip install targetleak
+pip install git+https://github.com/ShriyansBharuka/TargetLeak
 targetleak --demo
 ```
+
+> Not on PyPI yet, so install from the repository for now. Add `[parquet]`
+> for `.parquet` files: `pip install "targetleak[parquet] @ git+https://github.com/ShriyansBharuka/TargetLeak"`
 
 ```
 CRITICAL target-proxy [cancellation_reason]
@@ -72,7 +75,7 @@ targetleak data.csv --target y && python train.py
 ### In CI
 
 ```yaml
-- run: pip install targetleak
+- run: pip install git+https://github.com/ShriyansBharuka/TargetLeak
 - run: targetleak data/train.csv --target churned
 ```
 

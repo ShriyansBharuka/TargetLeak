@@ -881,14 +881,25 @@ def test_cli_requires_target_or_demo():
 
 # --- the benchmark is the README's evidence, so it gets tests too ------------
 
-def test_benchmark_runs_offline_and_reports_the_clean_datasets(capsys):
+def _load_benchmark():
+    """The benchmark needs scikit-learn. It is in the dev extra so CI runs it,
+    but skip rather than fail on a minimal install."""
+    pytest.importorskip("sklearn", reason="benchmark needs scikit-learn")
     import importlib.util
     import pathlib
     spec = importlib.util.spec_from_file_location(
-        "bench", pathlib.Path(__file__).resolve().parents[1]
-        / "benchmark" / "run_benchmark.py")
-    bench = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(bench)
+        "targetleak_benchmark",
+        pathlib.Path(__file__).resolve().parents[1] / "benchmark"
+        / "run_benchmark.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_benchmark_runs_offline_and_reports_the_clean_datasets(capsys):
+    import importlib.util
+    import pathlib
+    bench = _load_benchmark()
     assert bench.main(["--offline"]) == 0
     out = capsys.readouterr().out
     assert "false positives on clean data" in out
@@ -901,11 +912,5 @@ def test_benchmark_leak_kinds_match_the_report():
     """The benchmark's recall metric and the report's verdict wording read
     from two separate copies of this set. Adding a leak kind to one and not
     the other silently degrades both."""
-    import importlib.util
-    import pathlib
-    spec = importlib.util.spec_from_file_location(
-        "bench2", pathlib.Path(__file__).resolve().parents[1]
-        / "benchmark" / "run_benchmark.py")
-    bench = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(bench)
+    bench = _load_benchmark()
     assert bench.LEAK_KINDS <= set(tl.FIXES), bench.LEAK_KINDS - set(tl.FIXES)

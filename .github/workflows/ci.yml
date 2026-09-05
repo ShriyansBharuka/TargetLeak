@@ -17,31 +17,77 @@ jobs:
         include:
           - python: "3.10"
             pandas: "pandas>=2.0,<3.0"
+            major: "2"
           - python: "3.12"
             pandas: "pandas>=2.0,<3.0"
+            major: "2"
           - python: "3.13"
             pandas: "pandas>=3.0"
+            major: "3"
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
 
       - name: Install
+        # The pin goes on AFTER the editable install. pyproject declares
+        # `pandas>=2.0` with no upper bound, so installing the package second
+        # would resolve pandas forward and quietly test pandas 3 in all three
+        # jobs - a green matrix that checked one version.
+        env:
+          PANDAS_SPEC: ${{ matrix.pandas }}
         run: |
           python -m pip install --upgrade pip
-          pip install "${{ matrix.pandas }}"
           pip install -e ".[dev]"
+          pip install "$PANDAS_SPEC"
 
-      - name: Show versions
-        run: python -c "import pandas, numpy; print('pandas', pandas.__version__, 'numpy', numpy.__version__)"
+      - name: Confirm the pin actually took
+        # Without this the matrix can silently collapse onto one version.
+        env:
+          WANT_MAJOR: ${{ matrix.major }}
+        run: |
+          python - <<'PY'
+          import os, pandas, numpy
+          got = pandas.__version__.split(".")[0]
+          want = os.environ["WANT_MAJOR"]
+          print(f"pandas {pandas.__version__}, numpy {numpy.__version__}")
+          assert got == want, f"wanted pandas {want}.x, resolved {pandas.__version__}"
+          PY
 
       - name: Test
         run: pytest -q
 
       - name: CLI smoke test
+        # `targetleak` exits 1 by design when it finds a critical leak, and the
+        # demo frame always does. GitHub runs these blocks under
+        # `bash -eo pipefail`, so piping it straight into python made the whole
+        # pipeline return 1 and failed this step on every commit since the
+        # first. Capture to a file, check the exit code deliberately, then read.
         run: |
-          targetleak --demo || test $? -eq 1   # exit 1 is correct: the demo leaks
-          targetleak --demo --json | python -c "import json,sys; d=json.load(sys.stdin); assert d['critical']>=1, d"
+          set +e
+          targetleak --demo > human.txt
+          human_rc=$?
+          targetleak --demo --json > findings.json
+          json_rc=$?
+          set -e
+          test "$human_rc" -eq 1 || { echo "expected exit 1, got $human_rc"; exit 1; }
+          test "$json_rc" -eq 1 || { echo "expected exit 1, got $json_rc"; exit 1; }
+          grep -q "VERDICT" human.txt
+          python - <<'PY'
+          import json
+          d = json.load(open("findings.json"))
+          assert d["critical"] >= 1, d
+          assert d["fix_code"], "remediation code missing"
+          print(f"{d['critical']} critical, {d['warning']} warning")
+          PY
+
+      - name: Benchmark
+        # The README's evidence. Offline, so it measures the five bundled
+        # sklearn datasets and skips the download; it exits non-zero if it
+        # ends up with no datasets at all.
+        run: python benchmark/run_benchmark.py --offline
