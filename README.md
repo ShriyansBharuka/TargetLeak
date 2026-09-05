@@ -11,10 +11,13 @@ targetleak --demo
 ```
 
 ```
-CRITICAL target-proxy [refund_amount]
-         alone reaches AUC 1.0000. One column should not nearly solve the
-         target - this is very likely computed from the answer, or recorded
-         after it was known.
+CRITICAL target-proxy [cancellation_reason]
+         alone separates the target at 1.0000 (true AUC 1.0000), 29.9 SE
+         above chance. One column should not nearly solve the target - this
+         is very likely computed from the answer, or recorded after it was
+         known.
+         EVIDENCE: 'not_given': 0% positive (n=568) | 'moved': 100% positive
+         (n=302) | 'price': 100% positive (n=330)
          FIX: Establish when this column receives its value. If it is
          written at or after the moment the target becomes known, it cannot
          be an input. Drop it, or rebuild it from data available strictly
@@ -23,6 +26,9 @@ CRITICAL target-proxy [refund_amount]
 VERDICT: 3 critical leak(s). Do not trust this model's test score until they
 are resolved.
 ```
+
+Every finding carries the measurement it rests on, how far that stands from
+chance, and what to do about it.
 
 ## The idea
 
@@ -70,6 +76,21 @@ targetleak data.csv --target y && python train.py
 - run: targetleak data/train.csv --target churned
 ```
 
+A checker with no way to accept a finding can never go green, so it gets
+deleted. Reviewed a column and decided it is fine? Name it:
+
+```bash
+targetleak data.csv --target y --ignore customer_tier,promo_code
+```
+
+Ignored columns are **still listed**, at info level. A silent suppression is
+how the next real regression gets missed.
+
+There is a ready-made workflow in
+[`.github/workflows/leak-check.yml`](.github/workflows/leak-check.yml) that
+comments the findings on the pull request and attaches the HTML report. Your
+data never leaves your runner; only the findings reach the comment.
+
 ## What it checks
 
 | Check | Catches |
@@ -84,9 +105,16 @@ targetleak data.csv --target y && python train.py
 | `temporal-column` | Dates, where a random split trains on the future |
 | `duplicate-rows` | Repeats that inflate the test score |
 | `target-mostly-null` | A training set far smaller than the row count suggests |
-| `constant` | Features carrying no information on your labelled rows |
+| `constant` | Features carrying no information at all |
+| `dead-on-labelled-rows` | Features that vary in the file but not on labelled rows |
+| `underpowered` | Scores too high to ignore but on too little data to trust |
 
-Binary and continuous targets. CSV, TSV, and Parquet.
+Binary, multiclass (one-vs-rest) and continuous targets. CSV, TSV, Parquet.
+
+Every score is also required to stand clear of the null by several standard
+errors, with the bar rising as more columns are tested. Without that, 60
+columns of pure noise on 20 rows produce a "critical leak" - the threshold
+alone has no idea how much data it is looking at.
 
 ## Two details that make it work
 
@@ -102,6 +130,10 @@ real data where seven `label_*` columns sat in the feature matrix scoring only
 0.60–0.76 — invisible to statistics, obvious from their names.
 
 ## A real find
+
+One dataset is not a validation set, and this one is the author's own project
+rather than an independent trial - so read it as a worked example, not a
+benchmark. It is here because the bugs were real and nobody had planted them.
 
 Run against a 448,000-row × 69-column production training set for a live
 trading system, `targetleak` reported that the target column was 79% null and
@@ -124,6 +156,10 @@ in what reached the model.
   That lives in your code, not your data — read your pipeline.
 - A `suspiciously-predictive` finding is not proof. Some features really are
   that good. It tells you where to look.
+- The power gate is a Bonferroni-flavoured approximation, not an exact test.
+  It is there to stop small samples producing confident nonsense, and it will
+  occasionally hold back a real finding on a small dataset - which is reported
+  as `underpowered` rather than hidden.
 - It cannot know your business. A column that is legitimate at prediction time
   in one system is a leak in another. You decide; it points.
 

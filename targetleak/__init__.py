@@ -31,6 +31,16 @@ __all__ = ["analyse", "diagnose", "report", "to_html", "fix_code", "Finding",
 # A real multi-feature model rarely clears 0.98 on one column. A leak does.
 AUC_CRITICAL = 0.98
 AUC_WARN = 0.90
+# An absolute threshold alone is not enough: on 20 rows a pure-noise column
+# clears 0.90 by luck, and with 60 columns tested that happens routinely. Every
+# score must therefore also stand off the null by Z_MIN standard errors, where
+# the null SE comes from the Hanley-McNeil variance of AUC under no effect.
+# Z_MIN grows with the number of columns as a Bonferroni approximation - crude,
+# but it is the difference between reporting noise and not.
+Z_TABLE = ((10, 3.5), (100, 4.0), (1000, 4.5))
+Z_MAX = 5.0
+# Above this many distinct values a non-numeric target cannot be handled.
+MAX_CLASSES = 20
 # Above this share of unique values a column is an identifier, not a feature.
 ID_UNIQUE_RATIO = 0.95
 # Categories rarer than this are ignored when judging purity -- a category with
@@ -88,10 +98,15 @@ FIXES = {
         "labelled rows differ systematically from unlabelled ones - if they "
         "do, the model only works on that slice, whatever the test score says.",
     "constant":
-        "Carries no information as-is. Worth investigating rather than just "
-        "dropping: a feature that varies in the file but not on your labelled "
-        "rows usually means an upstream job is not populating it for the rows "
-        "you actually train on, which is a data bug, not a dead column.",
+        "Carries no information. Safe to drop, but check first that it is "
+        "meant to be populated at all - a feature that is empty everywhere is "
+        "often a pipeline that was never wired up.",
+    "dead-on-labelled-rows":
+        "Find out why the two do not overlap. Usually the labels cover one "
+        "period and the feature job backfilled another, so joining them leaves "
+        "a constant. Until that is fixed the feature contributes nothing, and "
+        "any conclusion that 'the signal is not there' was measured without "
+        "it.",
     "unscoreable":
         "Flatten or encode the column if it matters - one value per cell. "
         "Otherwise ignore this: the column was skipped, nothing else was.",
@@ -165,10 +180,13 @@ class Finding:
 
 
 def _auc(scores, y):
-    """Rank AUC (Mann-Whitney U), tie-corrected, direction-agnostic.
+    """True rank AUC (Mann-Whitney U), tie-corrected, in [0, 1].
 
-    Returns max(auc, 1-auc): a feature that predicts the target perfectly
-    backwards is exactly as leaky as one that predicts it forwards.
+    Returns the AUC as measured, NOT max(auc, 1-auc). An earlier version
+    folded the two together, so a perfectly inverted feature was reported as
+    "AUC 1.0000" when its actual AUC was 0.0000 - a number the user could not
+    reconcile with their own metrics. Direction is handled by the caller via
+    `_separation`, which is what thresholds are applied to.
     """
     s = pd.Series(scores)
     ok = s.notna()
@@ -178,8 +196,55 @@ def _auc(scores, y):
     if n1 == 0 or n0 == 0 or len(s) == 0:
         return 0.5
     ranks = s.rank(method="average").to_numpy()
-    auc = (ranks[yy == 1].sum() - n1 * (n1 + 1) / 2) / (n1 * n0)
+    return float((ranks[yy == 1].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))
+
+
+def _separation(auc):
+    """Distance from chance, folded onto [0.5, 1]. A feature that predicts the
+    target perfectly backwards is exactly as leaky as one that predicts it
+    forwards, so thresholds run on this rather than on the raw AUC."""
     return float(max(auc, 1.0 - auc))
+
+
+def _null_se(n1, n0):
+    """SE of AUC under the null hypothesis of no association.
+
+    Hanley-McNeil with AUC=0.5: sqrt((n1 + n0 + 1) / (12 * n1 * n0)). This is
+    what makes the difference between "0.93 on 5,000 rows" (a finding) and
+    "0.93 on 18 rows" (a coin landing badly).
+    """
+    if n1 < 1 or n0 < 1:
+        return float("inf")
+    return float(np.sqrt((n1 + n0 + 1.0) / (12.0 * n1 * n0)))
+
+
+def _z_min(n_features):
+    """Bonferroni-flavoured z floor: more columns tested, higher the bar."""
+    for limit, z in Z_TABLE:
+        if n_features <= limit:
+            return z
+    return Z_MAX
+
+
+def _target_kind(y):
+    """binary | multiclass | continuous | degenerate | unsupported.
+
+    Multiclass used to fall through to the continuous branch, where a Spearman
+    correlation was computed against nominal class codes - a meaningless
+    number reported with full confidence. Silent wrong answers are worse than
+    refusing, so each kind is now named and handled explicitly.
+    """
+    s = pd.Series(y).dropna()
+    n = int(s.nunique())
+    if n < 2:
+        return "degenerate"
+    if n == 2:
+        return "binary"
+    if pd.api.types.is_numeric_dtype(s) and n > MAX_CLASSES:
+        return "continuous"
+    if n <= MAX_CLASSES:
+        return "multiclass"
+    return "unsupported"
 
 
 def _oof_target_encode(col, y, folds=FOLDS, seed=0):
@@ -200,25 +265,69 @@ def _oof_target_encode(col, y, folds=FOLDS, seed=0):
     return out.fillna(y.mean())
 
 
-def _is_binary(y):
-    return pd.Series(y).dropna().nunique() == 2
+def _score_column(col, y, kind, n_features=1):
+    """Measure one column against the target.
 
-
-def _score_column(col, y, binary):
-    """Single-column predictive power in [0.5, 1.0]. None if unscoreable."""
+    Returns None when unscoreable, else a dict:
+      score    separation in [0.5, 1], what thresholds are applied to
+      auc      the true AUC where one exists, so the number is reconcilable
+      metric   what to call it in the report
+      z        standard errors above the null - guards against small samples
+      z_min    the bar `z` had to clear
+    """
     if col.nunique(dropna=True) < 2:
         return None
     numeric = pd.api.types.is_numeric_dtype(col) and not _looks_categorical(col)
-    if binary:
-        yb = (pd.Series(y) == pd.Series(y).dropna().unique()[-1]).astype(int).to_numpy()
-        scores = col if numeric else _oof_target_encode(col.astype("object"), yb)
-        return _auc(scores, yb)
-    # Continuous target: |Spearman| rescaled onto the same [0.5, 1] axis so one
-    # threshold covers both problem types.
-    s = col if numeric else _oof_target_encode(col.astype("object"), y)
-    rho = pd.Series(s).corr(pd.Series(np.asarray(y), index=col.index),
-                            method="spearman")
-    return None if pd.isna(rho) else 0.5 + abs(float(rho)) / 2
+    zmin = _z_min(n_features)
+
+    def numeric_or_encoded(target_vec):
+        return col if numeric else _oof_target_encode(col.astype("object"),
+                                                      target_vec)
+
+    if kind == "binary":
+        classes = pd.Series(y).dropna().unique()
+        yb = (pd.Series(y) == classes[-1]).astype(int).to_numpy()
+        auc = _auc(numeric_or_encoded(yb), yb)
+        sep = _separation(auc)
+        se = _null_se(int((yb == 1).sum()), int((yb == 0).sum()))
+        return {"score": sep, "auc": auc, "metric": "AUC",
+                "z": (sep - 0.5) / se if se else 0.0, "z_min": zmin}
+
+    if kind == "multiclass":
+        # One-vs-rest: a leak only has to give away one class.
+        best, best_auc, best_z, best_cls = 0.5, None, 0.0, None
+        for cls in pd.Series(y).dropna().unique():
+            ind = (pd.Series(y) == cls).astype(int).to_numpy()
+            auc = _auc(numeric_or_encoded(ind), ind)
+            sep = _separation(auc)
+            if sep > best:
+                se = _null_se(int(ind.sum()), int((ind == 0).sum()))
+                best, best_auc = sep, auc
+                best_z = (sep - 0.5) / se if se else 0.0
+                best_cls = cls
+        # item() first: numpy scalars repr as "np.int64(3)", which is not a
+        # thing to show a user in the middle of a sentence.
+        label = getattr(best_cls, "item", lambda: best_cls)()
+        return {"score": best, "auc": best_auc,
+                "metric": f"AUC vs class {label!r}",
+                "z": best_z, "z_min": zmin}
+
+    if kind == "continuous":
+        s = numeric_or_encoded(np.asarray(y))
+        yy = pd.Series(np.asarray(y), index=col.index)
+        rho = pd.Series(s).corr(yy, method="spearman")
+        if pd.isna(rho):
+            return None
+        n = int(min(pd.Series(s).notna().sum(), yy.notna().sum()))
+        # Fisher z for Spearman, mapped onto the same [0.5, 1] axis as AUC so
+        # one set of thresholds covers both problem types.
+        r = min(abs(float(rho)), 0.999999)
+        z = (0.5 * np.log((1 + r) / (1 - r)) * np.sqrt(max(n - 3, 1))
+             if n > 3 else 0.0)
+        return {"score": 0.5 + r / 2, "auc": None,
+                "metric": "|Spearman| (scaled)", "z": float(z), "z_min": zmin}
+
+    return None
 
 
 def _looks_categorical(col):
@@ -235,12 +344,43 @@ _FUTURE_NAMES = ("future", "fwd", "forward", "ahead", "t_plus", "tplus",
                  "lead_", "_lead", "nextday", "next_day")
 _AFTER_NAMES = ("next_", "after_", "post_", "_post", "resolved", "final_")
 _GENERIC_TARGETS = {"target", "label", "y", "outcome", "class", "result", "value"}
+# Names that mark a column as a PAST value of something. A lagged target is a
+# standard, legitimate feature; flagging it produces exactly the false positive
+# that gets a checker switched off.
+_LAG_NAMES = ("_lag", "lag_", "_prev", "prev_", "_prior", "prior_", "_last",
+              "last_", "_ytd", "_l1y", "_1y", "_7d", "_28d", "_30d", "_90d",
+              "trailing", "rolling", "_to_date", "historic", "_ago",
+              "_yesterday", "_lastyear", "_last_year", "_past")
 
 
 def _suspicious_name(name, target=None):
     """(severity, reason) for a column whose NAME implies it is not a feature."""
     n = str(name).lower()
-    if any(k in n for k in _LABEL_NAMES):
+    t = str(target).lower() if target else ""
+    # A lagged copy of the target is one of the most common legitimate
+    # features there is. `revenue_last_year` when predicting `revenue` is not
+    # a leak, and telling someone to drop it is worse than saying nothing.
+    if any(k in n for k in _LAG_NAMES):
+        return None
+    # A column carrying the target's whole name is a sibling of it: predicting
+    # `label_cs` with `label_cs_5d` in the features is the same label at a
+    # different horizon. Checked before the token rules below, because those
+    # deliberately ignore any word the target itself contains - which would
+    # otherwise silence exactly this case.
+    if len(t) >= 5 and t not in _GENERIC_TARGETS and t in n and n != t:
+        return ("critical", f"its name contains the target's own name {t!r}, so "
+                            "it is most likely the same quantity at a different "
+                            "horizon, aggregation or lag. Those are labels, not "
+                            "features.")
+    # A label-ish word stops being evidence only when the target IS that word.
+    # Predicting a column called `target` says nothing about `customer_target_
+    # group`. But predicting `label_cs` means this project prefixes its labels
+    # with "label", so `label_sector_residual` is more suspicious, not less -
+    # an earlier version had this backwards and went quiet on six real labels.
+    generic = t in _GENERIC_TARGETS
+    label_hits = [k for k in _LABEL_NAMES
+                  if k in n and not (generic and k in t)]
+    if label_hits:
         return ("critical", "the name says this is a label, not a feature. Another "
                             "label is still future information even when it "
                             "correlates only mildly with the one you are training on.")
@@ -251,7 +391,6 @@ def _suspicious_name(name, target=None):
         return ("warning", "the name implies something recorded after the event. "
                            "Confirm it is known at prediction time.")
     if target:
-        t = str(target).lower()
         t_tokens = {p for p in t.replace("-", "_").split("_") if len(p) >= 4}
         n_tokens = {p for p in n.replace("-", "_").split("_") if len(p) >= 4}
         # Matched both ways on purpose: a target 'churned' and a column
@@ -403,23 +542,52 @@ def _category_purity(col, y):
     return float(pure["count"].sum() / len(col)) if len(col) else 0.0
 
 
-def analyse(df, target, split=None, group=None):
-    """Return a list of Findings, worst first."""
+def analyse(df, target, split=None, group=None, ignore=()):
+    """Return a list of Findings, worst first.
+
+    `ignore` names columns you have already reviewed and accepted. Without it
+    a run that finds anything can never go green, so a team wires this into CI,
+    watches it fail on a column they have deliberately kept, and deletes the
+    check. Accepted columns are still reported, at info level, so a suppression
+    stays visible instead of quietly hiding a later regression.
+    """
     if target not in df.columns:
         raise ValueError(f"target column {target!r} not in data: {list(df.columns)[:12]}")
     y = df[target]
     if y.isna().all():
         raise ValueError(f"target column {target!r} is entirely null")
-    binary = _is_binary(y)
+    ignore = {str(c) for c in (ignore or ())}
+    kind = _target_kind(y)
+    if kind == "degenerate":
+        raise ValueError(
+            f"target column {target!r} has fewer than 2 distinct values - "
+            "there is nothing to predict.")
+    if kind == "unsupported":
+        raise ValueError(
+            f"target column {target!r} is non-numeric with "
+            f"{y.dropna().nunique():,} distinct values. That is neither a "
+            f"classification target (<= {MAX_CLASSES} classes) nor a numeric "
+            "one. Encode it, or point --target at the right column.")
+    binary = kind == "binary"
     findings = []
     skip = {target} | ({split} if split else set())
     features = [c for c in df.columns if c not in skip]
     if not features:
         raise ValueError("no feature columns left after excluding target/split")
+    unknown = ignore - set(df.columns)
+    if unknown:
+        findings.append(Finding(
+            "warning", "stale-ignore", None,
+            f"ignored column(s) not present in the data: "
+            f"{sorted(unknown)}. An ignore list that outlives its column "
+            "silently stops protecting you - remove them."))
+    scored_features = [c for c in features if c not in ignore]
 
     findings.append(Finding("info", "target", target,
-                            f"{'binary' if binary else 'continuous'}, "
-                            f"{len(df):,} rows, {len(features)} features"))
+                            f"{kind}, {len(df):,} rows, "
+                            f"{len(features)} features"
+                            + (f", {len(ignore & set(features))} ignored"
+                               if ignore & set(features) else "")))
 
     null_share = float(y.isna().mean())
     if null_share > 0.05:
@@ -436,6 +604,13 @@ def analyse(df, target, split=None, group=None):
     # *which rows have labels* scores like a catastrophic leak. Seen on real
     # data: a ticker column hit AUC 0.93 purely because only 26 of 127
     # tickers were labelled at all.
+    # Captured BEFORE the unlabelled rows are dropped: a column that varies in
+    # the file but is constant on the labelled rows is not a dead column, it is
+    # an upstream job that never reached the training set. On real data that
+    # was 17 features, including an entire ingestion pipeline, and it was
+    # filed as a bare "no information" note.
+    varies_in_file = {c for c in features
+                      if _safe_nunique(df[c]) > 1}
     labelled = y.notna()
     if int(labelled.sum()) < 20:
         raise ValueError(
@@ -445,18 +620,20 @@ def analyse(df, target, split=None, group=None):
     y = y.loc[labelled]
 
     # --- names that give a column away regardless of its score -----------
-    for c in features:
+    for c in scored_features:
         hit = _suspicious_name(c, target)
         if hit:
             findings.append(Finding(hit[0], "suspicious-name", c, hit[1]))
 
     # --- per-column predictive power -------------------------------------
-    for c in features:
+    for c in scored_features:
         # One hostile column must not take the whole run down. Real frames
         # carry list- and dict-valued columns (embeddings, JSON metadata)
         # that raise on nunique(); a tool that dies on them gets uninstalled.
         try:
-            findings.extend(_column_findings(c, df[c], y, binary))
+            findings.extend(
+                _column_findings(c, df[c], y, kind, len(scored_features),
+                                 varied_in_file=c in varies_in_file))
         except Exception as e:
             findings.append(Finding(
                 "info", "unscoreable", c,
@@ -473,9 +650,10 @@ def analyse(df, target, split=None, group=None):
             "split these land on both sides and inflate test scores."))
 
     if split is not None:
-        findings.extend(_split_checks(df, target, split, features, group))
+        findings.extend(
+            _split_checks(df, target, split, scored_features, group))
 
-    for c in features:
+    for c in scored_features:
         try:
             if _is_timelike(df[c]):
                 findings.append(Finding(
@@ -484,6 +662,12 @@ def analyse(df, target, split=None, group=None):
                     "time, the model trains on the future to predict the past."))
         except Exception:
             pass
+
+    for c in sorted(ignore & set(features)):
+        findings.append(Finding(
+            "info", "ignored", c,
+            "excluded by the ignore list, so nothing was measured on it. "
+            "A leak introduced here in future will not be reported."))
 
     order = {"critical": 0, "warning": 1, "info": 2}
     findings.sort(key=lambda f: order[f.severity])
@@ -499,8 +683,16 @@ def _hashable(df):
         return False
 
 
-def _column_findings(c, col, y, binary):
+def _safe_nunique(col):
+    try:
+        return int(col.nunique(dropna=True))
+    except Exception:
+        return 0
+
+
+def _column_findings(c, col, y, kind, n_features=1, varied_in_file=False):
     """Every check for one column. Raises freely; the caller isolates it."""
+    binary = kind == "binary"
     findings = []
     n_unique = col.nunique(dropna=True)
     if _looks_like_id(col):
@@ -518,47 +710,81 @@ def _column_findings(c, col, y, binary):
     # leaks entirely through its NaN pattern.
     na_share = float(col.isna().mean())
     if 0.01 < na_share < 0.99:
-        na_score = _score_column(col.isna().astype(int), y, binary)
-        if na_score is not None and na_score >= AUC_WARN:
-            sev = "critical" if na_score >= AUC_CRITICAL else "warning"
+        na = _score_column(col.isna().astype(int), y, kind, n_features)
+        if na and na["score"] >= AUC_WARN and na["z"] >= na["z_min"]:
+            sev = "critical" if na["score"] >= AUC_CRITICAL else "warning"
             findings.append(Finding(
                 sev, "missingness-leak", c,
                 f"whether this column is missing predicts the target at "
-                f"{na_score:.4f} ({na_share:.0%} missing). The NaN pattern "
+                f"{na['score']:.4f} ({na_share:.0%} missing). The NaN pattern "
                 "carries the answer even if the values do not.",
                 _evidence_missing(col, y, binary)))
 
-    score = _score_column(col, y, binary)
-    if score is None:
-        findings.append(Finding("info", "constant", c,
-                                "single value or unscoreable - no information"))
+    m = _score_column(col, y, kind, n_features)
+    if m is None:
+        if varied_in_file:
+            findings.append(Finding(
+                "warning", "dead-on-labelled-rows", c,
+                "varies elsewhere in the file but holds one single value on "
+                "every labelled row, so the model has never seen it change. "
+                "Most often the labels and this column cover different "
+                "periods and the join leaves a constant; it can also just "
+                "mark which rows were labelled. Either way it contributes "
+                "nothing to training."))
+        else:
+            findings.append(Finding(
+                "info", "constant", c,
+                "single value throughout - no information to learn from."))
         return findings
-    metric = "AUC" if binary else "|Spearman|-scaled"
+    score, metric, z, z_min = m["score"], m["metric"], m["z"], m["z_min"]
 
     def scored(ev):
-        """Carry the measured score and its reference band alongside the
-        evidence, so a report can present it the way a lab value is read:
-        against the range a healthy column would fall in."""
+        """Carry the measurement and its reference band alongside the evidence,
+        so a report can present it the way a lab value is read: against the
+        range a healthy column falls in."""
         return {**(ev or {"kind": "score_only"}), "score": float(score),
-                "metric": metric, "band": [0.5, AUC_WARN, AUC_CRITICAL, 1.0]}
+                "auc": m["auc"], "metric": metric, "z": float(z),
+                "z_min": float(z_min),
+                "band": [0.5, AUC_WARN, AUC_CRITICAL, 1.0]}
 
-    if score >= AUC_CRITICAL:
+    # Direction is reported, not folded away: an inverted relationship is
+    # equally leaky but the raw number has to reconcile with the user's own.
+    raw = "" if m["auc"] is None else (
+        f" (true {metric} {m['auc']:.4f}"
+        + (", inverted)" if m["auc"] < 0.5 else ")"))
+    strength = (f"separates the target at {score:.4f}{raw}, "
+                f"{z:.1f} SE above chance")
+
+    if score < AUC_WARN:
+        pass
+    elif z < z_min:
+        # The absolute threshold is met but the sample is too small to tell
+        # this apart from luck. Reporting it as a leak is how a checker earns
+        # a reputation for crying wolf.
+        findings.append(Finding(
+            "info", "underpowered", c,
+            f"{strength}, which does not clear the {z_min:.1f} SE bar for "
+            f"{n_features} columns tested on {len(col):,} rows. On a sample "
+            "this small a column of pure noise reaches that score by luck, so "
+            "it is reported without a severity rather than called a leak.",
+            scored(_evidence(col, y, binary))))
+    elif score >= AUC_CRITICAL:
         findings.append(Finding(
             "critical", "target-proxy", c,
-            f"alone reaches {metric} {score:.4f}. One column should not "
-            "nearly solve the target - this is very likely computed from "
-            "the answer, or recorded after it was known.",
+            f"alone {strength}. One column should not nearly solve the "
+            "target - this is very likely computed from the answer, or "
+            "recorded after it was known.",
             scored(_evidence(col, y, binary))))
-    elif score >= AUC_WARN:
+    else:
         findings.append(Finding(
             "warning", "suspiciously-predictive", c,
-            f"alone reaches {metric} {score:.4f}. Plausible for a genuinely "
-            "strong feature, but confirm it exists at prediction time.",
+            f"alone {strength}. Plausible for a genuinely strong feature, but "
+            "confirm it exists at prediction time.",
             scored(_evidence(col, y, binary))))
 
     if not pd.api.types.is_numeric_dtype(col) or _looks_categorical(col):
         purity = _category_purity(col.astype("object"), y)
-        if purity >= 0.5 and score is not None and score >= AUC_WARN:
+        if purity >= 0.5 and score >= AUC_WARN and z >= z_min:
             findings.append(Finding(
                 "critical", "pure-categories", c,
                 f"{purity:.0%} of rows fall in categories with exactly one "
@@ -598,9 +824,16 @@ def _split_checks(df, target, split, features, group):
     feat = [c for c in features if c != group]
 
     if feat:
-        ka = set(map(tuple, a[feat].astype("object").fillna("\0").to_numpy()))
-        kb = list(map(tuple, b[feat].astype("object").fillna("\0").to_numpy()))
-        shared = sum(1 for r in kb if r in ka)
+        # Row hashes, not tuples of Python objects. Materialising one tuple
+        # per row held the entire frame a second time over in the interpreter;
+        # on a wide 10M-row table that is the difference between a check and
+        # an out-of-memory kill.
+        try:
+            ha = pd.util.hash_pandas_object(a[feat], index=False)
+            hb = pd.util.hash_pandas_object(b[feat], index=False)
+            shared = int(hb.isin(set(ha.to_numpy())).sum())
+        except TypeError:
+            return out  # unhashable cell values; nothing to compare
         if shared:
             out.append(Finding(
                 "critical", "train-test-contamination", None,
@@ -890,6 +1123,9 @@ def main(argv=None):
     ap.add_argument("--target", help="name of the target column")
     ap.add_argument("--split", help="column marking train/test rows")
     ap.add_argument("--group", help="entity column to exclude from row matching")
+    ap.add_argument("--ignore", default="", metavar="COLS",
+                    help="comma-separated columns you have reviewed and "
+                         "accepted; still listed, but never fail the run")
     ap.add_argument("--json", action="store_true",
                     help="machine-readable output, for CI")
     ap.add_argument("--no-fixes", action="store_true",
@@ -916,6 +1152,8 @@ def main(argv=None):
                     version=f"targetleak {__version__}")
     a = ap.parse_args(argv)
 
+    ig = [c.strip() for c in a.ignore.split(",") if c.strip()]
+
     if (a.train is None) != (a.val is None):
         ap.error("--train and --val must be given together")
 
@@ -923,10 +1161,10 @@ def main(argv=None):
         result = diagnose(a.train, a.val, a.baseline, a.metric)
         target = None
     elif a.demo:
-        result = analyse(demo_frame(), "churned", a.split, a.group)
+        result = analyse(demo_frame(), "churned", a.split, a.group, ig)
         target = "churned"
     elif a.data and a.target:
-        result = analyse(load(a.data), a.target, a.split, a.group)
+        result = analyse(load(a.data), a.target, a.split, a.group, ig)
         target = a.target
     else:
         ap.error("give DATA and --target, or --demo, or --train and --val")

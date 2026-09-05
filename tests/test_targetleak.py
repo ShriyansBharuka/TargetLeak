@@ -51,10 +51,10 @@ def test_does_not_flag_an_honestly_strong_feature(demo):
 
 
 def test_score_separates_honest_from_leaky(demo):
-    honest = tl._score_column(demo["signal"], demo["churned"], True)
-    leaky = tl._score_column(demo["refund_amount"], demo["churned"], True)
-    assert 0.70 < honest < tl.AUC_WARN, f"honest feature scored {honest:.3f}"
-    assert leaky > tl.AUC_CRITICAL, f"leak scored only {leaky:.3f}"
+    honest = tl._score_column(demo["signal"], demo["churned"], "binary")
+    leaky = tl._score_column(demo["refund_amount"], demo["churned"], "binary")
+    assert 0.70 < honest["score"] < tl.AUC_WARN, honest
+    assert leaky["score"] > tl.AUC_CRITICAL, leaky
 
 
 def test_float_features_are_not_mistaken_for_identifiers():
@@ -77,7 +77,7 @@ def test_high_cardinality_innocent_column_does_not_leak():
     n = 1000
     df = pd.DataFrame({"city": rng.choice([f"city{i}" for i in range(120)], n),
                        "y": rng.integers(0, 2, n)})
-    assert tl._score_column(df["city"], df["y"], True) < tl.AUC_WARN
+    assert tl._score_column(df["city"], df["y"], "binary")["score"] < tl.AUC_WARN
 
 
 # --- name heuristics ---------------------------------------------------------
@@ -103,9 +103,20 @@ def test_names_catch_leaks_statistics_miss():
 
 
 @pytest.mark.parametrize("column,target,expected", [
-    ("customer_target_group", "target", "critical"),  # 'target' in the name
+    # Sibling labels: the column carries the target's whole name.
+    ("label_cs_5d", "label_cs", "critical"),
+    ("regional_sales_target", "sales_target", "critical"),
+    # The project's label prefix stays evidence even though the target shares
+    # it - getting this backwards silenced six real labels on live data.
+    ("label_sector_residual", "label_cs", "critical"),
+    ("Target", "label_cs", "critical"),
+    # ...but a target that IS the generic word tells you nothing about others.
+    ("customer_target_group", "target", None),
+    ("region", "target", None),
+    ("customer_target_group", "churned", "critical"),  # here 'target' is a tell
+    ("revenue_last_year", "revenue", None),           # a legitimate lag
+    ("sales_rolling_28d", "sales", None),             # ...and a rolling window
     ("churn_reason", "churned", "warning"),           # shares a stem
-    ("region", "target", None),                       # generic target, no match
     ("plain_feature", "churned", None),
 ])
 def test_suspicious_name_matching(column, target, expected):
@@ -141,8 +152,13 @@ def test_unlabelled_rows_are_not_the_negative_class():
         "t": t,
     })
     out = tl.analyse(df, "t")
-    loud = {f.column for f in out if f.severity in ("critical", "warning")}
-    assert "cohort" not in loud, f"scored labelled-ness as leakage: {loud}"
+    # Scoped to leakage kinds on purpose: `cohort` legitimately earns a
+    # dead-on-labelled-rows warning (it is constant among labelled rows). What
+    # must never happen is it being scored as a *leak*.
+    leaky = {f.column for f in out
+             if f.kind in ("target-proxy", "suspiciously-predictive",
+                           "pure-categories", "missingness-leak")}
+    assert "cohort" not in leaky, f"scored labelled-ness as leakage: {leaky}"
     assert any(f.kind == "target-mostly-null" for f in out)
 
 
@@ -150,6 +166,176 @@ def test_too_few_labelled_rows_raises():
     df = pd.DataFrame({"f": range(100), "t": [1, 0] + [None] * 98})
     with pytest.raises(ValueError, match="target value"):
         tl.analyse(df, "t")
+
+
+def test_dead_on_labelled_rows_outranks_a_plain_constant():
+    """A column that varies in the file but is constant on every labelled row
+    is a broken join, not a dead column. On real data this was 17 features -
+    an entire ingestion pipeline - and it was filed as a bare info note."""
+    rng = np.random.default_rng(21)
+    n = 600
+    t = np.full(n, np.nan)
+    t[:300] = rng.integers(0, 2, 300)
+    df = pd.DataFrame({
+        "insider_flow": np.concatenate([np.zeros(300), rng.normal(size=300)]),
+        "always_empty": np.zeros(n),
+        "ok": rng.normal(size=n),
+        "t": t,
+    })
+    by_kind = {f.kind: f for f in tl.analyse(df, "t")}
+    assert by_kind["dead-on-labelled-rows"].column == "insider_flow"
+    assert by_kind["dead-on-labelled-rows"].severity == "warning"
+    assert by_kind["constant"].column == "always_empty"
+    assert by_kind["constant"].severity == "info"
+
+
+# --- statistical power: the flaw a reviewer would attack first ---------------
+
+@pytest.mark.parametrize("n", [20, 30, 50])
+def test_small_samples_do_not_produce_leaks(n):
+    """60 columns of pure noise on a handful of rows. A fixed 0.90 threshold
+    ignores sample size, so a coin landing badly reads as a leak: at n=20 this
+    reported a critical finding on random data. Nothing here may be critical
+    or warning."""
+    rng = np.random.default_rng(7)
+    df = pd.DataFrame({f"f{i}": rng.normal(size=n) for i in range(60)})
+    df["y"] = rng.integers(0, 2, n)
+    loud = [f for f in tl.analyse(df, "y")
+            if f.severity in ("critical", "warning")
+            and f.kind in ("target-proxy", "suspiciously-predictive",
+                           "pure-categories", "missingness-leak")]
+    assert not loud, [f"{f.kind}:{f.column}" for f in loud]
+
+
+def test_underpowered_findings_are_still_shown():
+    """Rare-event data: 4 positives in 40 rows. A column that separates them
+    perfectly still only stands 3.25 SE off the null, so it is reported and
+    explained rather than called a leak. Silence would be its own failure -
+    the user needs to see the column and know why it was not escalated."""
+    rng = np.random.default_rng(0)
+    y = np.array([1] * 4 + [0] * 36)
+    df = pd.DataFrame({"perfect_on_four": y + rng.normal(0, .01, 40), "y": y})
+    out = tl.analyse(df, "y")
+    under = [f for f in out if f.kind == "underpowered"]
+    assert under, [f"{f.kind}:{f.column}" for f in out]
+    assert under[0].severity == "info"
+    assert "SE" in under[0].detail
+    assert not [f for f in out if f.severity == "critical"]
+
+
+def test_the_same_column_is_critical_once_there_is_enough_data():
+    """The identical pattern at 10x the rows must escalate - the gate is about
+    power, not about being timid."""
+    rng = np.random.default_rng(0)
+    y = np.array([1] * 40 + [0] * 360)
+    df = pd.DataFrame({"perfect": y + rng.normal(0, .01, 400), "y": y})
+    assert "perfect" in {f.column for f in tl.analyse(df, "y")
+                         if f.severity == "critical"}
+
+
+def test_real_leak_still_caught_when_powered():
+    """The power gate must not blunt the actual product."""
+    rng = np.random.default_rng(0)
+    n = 2000
+    y = rng.integers(0, 2, n)
+    df = pd.DataFrame({"refund": y * 100.0 + rng.normal(0, .3, n), "y": y})
+    assert "refund" in {f.column for f in tl.analyse(df, "y")
+                        if f.severity == "critical"}
+
+
+def test_null_se_shrinks_with_sample_size():
+    assert tl._null_se(10, 10) > tl._null_se(1000, 1000)
+    assert tl._z_min(5) < tl._z_min(500)
+
+
+def test_reported_auc_is_the_real_auc():
+    """max(auc, 1-auc) was reported as "AUC", so a perfectly inverted feature
+    claimed AUC 1.0000 when its true AUC was 0.0000 - a number the user could
+    not reconcile with their own metrics."""
+    y = np.array([0, 0, 0, 1, 1, 1])
+    inverted = pd.Series([9.0, 8, 7, 3, 2, 1])
+    assert tl._auc(inverted, y) == 0.0
+    assert tl._separation(tl._auc(inverted, y)) == 1.0
+
+
+def test_inverted_leak_is_reported_as_inverted():
+    rng = np.random.default_rng(1)
+    n = 1500
+    y = rng.integers(0, 2, n)
+    df = pd.DataFrame({"backwards": -y * 80.0 + rng.normal(0, .4, n), "y": y})
+    f = next(x for x in tl.analyse(df, "y") if x.kind == "target-proxy")
+    assert "inverted" in f.detail, f.detail
+
+
+# --- multiclass targets: previously a silent wrong answer --------------------
+
+def test_multiclass_target_is_handled_not_mislabelled():
+    """A 4-class nominal target used to fall through to the continuous branch,
+    where a Spearman correlation against class codes is meaningless."""
+    rng = np.random.default_rng(3)
+    n = 1200
+    y = rng.integers(0, 4, n)
+    df = pd.DataFrame({"leaky": y * 10.0 + rng.normal(0, .2, n),
+                       "noise": rng.normal(size=n), "y": y})
+    out = tl.analyse(df, "y")
+    assert any("multiclass" in f.detail for f in out if f.kind == "target")
+    crit = {f.column for f in out if f.severity == "critical"}
+    assert "leaky" in crit and "noise" not in crit
+
+
+def test_multiclass_one_vs_rest_names_the_class():
+    rng = np.random.default_rng(4)
+    n = 900
+    y = rng.integers(0, 3, n)
+    df = pd.DataFrame({"tells_class_2": (y == 2).astype(float)
+                       + rng.normal(0, .01, n), "y": y})
+    f = next(x for x in tl.analyse(df, "y") if x.kind == "target-proxy")
+    assert "class" in f.data["metric"]
+    # numpy scalars repr as "np.int64(2)"; that must not reach a user.
+    assert "np." not in f.data["metric"], f.data["metric"]
+    assert "np." not in f.detail, f.detail
+
+
+def test_unsupported_target_raises_instead_of_guessing():
+    df = pd.DataFrame({"x": range(100),
+                       "t": [f"free text {i}" for i in range(100)]})
+    with pytest.raises(ValueError, match="distinct values"):
+        tl.analyse(df, "t")
+
+
+def test_single_valued_target_raises():
+    df = pd.DataFrame({"x": range(50), "t": [1] * 50})
+    with pytest.raises(ValueError, match="distinct values"):
+        tl.analyse(df, "t")
+
+
+# --- ignore list: without it the check can never go green in CI -------------
+
+def test_ignored_column_does_not_fail_the_run(demo):
+    before = {f.column for f in tl.analyse(demo, "churned")
+              if f.severity == "critical"}
+    assert "refund_amount" in before
+    after = tl.analyse(demo, "churned",
+                       ignore=["refund_amount", "cancellation_reason"])
+    assert not [f for f in after if f.severity == "critical"]
+
+
+def test_ignored_column_is_still_listed(demo):
+    """A silent suppression hides the next regression. It must stay visible."""
+    out = tl.analyse(demo, "churned", ignore=["refund_amount"])
+    noted = {f.column for f in out if f.kind == "ignored"}
+    assert "refund_amount" in noted
+
+
+def test_stale_ignore_entry_is_reported(demo):
+    out = tl.analyse(demo, "churned", ignore=["no_such_column"])
+    assert any(f.kind == "stale-ignore" for f in out)
+
+
+def test_cli_ignore_flag_flips_the_exit_code():
+    assert tl.main(["--demo"]) == 1
+    assert tl.main(["--demo", "--ignore",
+                    "refund_amount,cancellation_reason"]) == 0
 
 
 # --- missingness -------------------------------------------------------------
