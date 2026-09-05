@@ -126,6 +126,13 @@ def main(argv=None):
     a = ap.parse_args(argv)
 
     cases = build_cases(with_network=not a.offline)
+    if not cases:
+        # Without this, sklearn missing meant "0 false positives across 0
+        # columns" and exit 0 - a green benchmark measured on nothing, and
+        # this is the evidence the README cites.
+        print("no datasets loaded - install scikit-learn "
+              "(pip install '.[benchmark]')", file=sys.stderr)
+        return 2
     results = [evaluate(c) for c in cases]
 
     pos = [r for r in results if r["case"].leaks]

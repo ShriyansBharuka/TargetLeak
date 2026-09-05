@@ -277,48 +277,90 @@ def _score_column(col, y, kind, n_features=1):
     """
     if col.nunique(dropna=True) < 2:
         return None
-    numeric = pd.api.types.is_numeric_dtype(col) and not _looks_categorical(col)
     zmin = _z_min(n_features)
 
-    def numeric_or_encoded(target_vec):
-        return col if numeric else _oof_target_encode(col.astype("object"),
-                                                      target_vec)
+    def candidates(target_vec):
+        """Score vectors worth trying for this column.
+
+        An integer column is ambiguous - a measurement, where order carries
+        the signal, or a code, where it does not. Rank AUC sees only the
+        first and target encoding only the second, and choosing between them
+        by row count meant the SAME leak was caught at 12,000 rows and missed
+        at 2,000, and caught as strings but missed as the integers read_csv
+        actually gives you. Try both and keep the stronger: a tree model
+        would happily use either.
+        """
+        if pd.api.types.is_float_dtype(col):
+            return [col]                      # encoding a float is meaningless
+        if pd.api.types.is_datetime64_any_dtype(col):
+            # Order is the whole signal in a timestamp, and every value is
+            # distinct, so target encoding returns the global mean and scores
+            # 0.5 - a date that ranks perfectly with the target read as noise.
+            return [col.astype("int64")]
+        enc = _oof_target_encode(col.astype("object"), target_vec)
+        if pd.api.types.is_numeric_dtype(col):
+            return [col, enc]
+        return [enc]
+
+    def measure(target_ind):
+        """Best AUC over the candidate encodings, with the null SE computed
+        on the rows that were actually scored.
+
+        The SE must come from the scored subset. Taking it from the full
+        target inflated z by the column's missingness - a column with six
+        observed values among a thousand rows was reported as "27 SE above
+        chance", which is the opposite of what the power gate exists for.
+        """
+        best_auc, best_sep, best_se = 0.5, 0.5, float("inf")
+        for scores in candidates(target_ind):
+            ok = pd.Series(scores).notna().to_numpy()
+            used = np.asarray(target_ind)[ok]
+            auc = _auc(scores, target_ind)
+            sep = _separation(auc)
+            if sep >= best_sep:
+                best_auc, best_sep = auc, sep
+                best_se = _null_se(int((used == 1).sum()),
+                                   int((used == 0).sum()))
+        z = (best_sep - 0.5) / best_se if best_se not in (0, float("inf")) else 0.0
+        return best_auc, best_sep, z
 
     if kind == "binary":
-        classes = pd.Series(y).dropna().unique()
+        # sorted(), not unique(): unique() is order-of-appearance, so the
+        # positive class - and therefore the reported AUC and its "inverted"
+        # flag - changed when the rows were shuffled, while the evidence table
+        # below already used sorted order. One report contradicted itself.
+        classes = sorted(pd.Series(y).dropna().unique())
         yb = (pd.Series(y) == classes[-1]).astype(int).to_numpy()
-        auc = _auc(numeric_or_encoded(yb), yb)
-        sep = _separation(auc)
-        se = _null_se(int((yb == 1).sum()), int((yb == 0).sum()))
+        auc, sep, z = measure(yb)
         return {"score": sep, "auc": auc, "metric": "AUC",
-                "z": (sep - 0.5) / se if se else 0.0, "z_min": zmin}
+                "z": z, "z_min": zmin}
 
     if kind == "multiclass":
         # One-vs-rest: a leak only has to give away one class.
         best, best_auc, best_z, best_cls = 0.5, None, 0.0, None
-        for cls in pd.Series(y).dropna().unique():
+        for cls in sorted(pd.Series(y).dropna().unique(), key=repr):
             ind = (pd.Series(y) == cls).astype(int).to_numpy()
-            auc = _auc(numeric_or_encoded(ind), ind)
-            sep = _separation(auc)
+            auc, sep, z = measure(ind)
             if sep > best:
-                se = _null_se(int(ind.sum()), int((ind == 0).sum()))
-                best, best_auc = sep, auc
-                best_z = (sep - 0.5) / se if se else 0.0
-                best_cls = cls
-        # item() first: numpy scalars repr as "np.int64(3)", which is not a
-        # thing to show a user in the middle of a sentence.
-        label = getattr(best_cls, "item", lambda: best_cls)()
+                best, best_auc, best_z, best_cls = sep, auc, z, cls
+        label = _plain(best_cls)
         return {"score": best, "auc": best_auc,
                 "metric": f"AUC vs class {label!r}",
                 "z": best_z, "z_min": zmin}
 
     if kind == "continuous":
-        s = numeric_or_encoded(np.asarray(y))
         yy = pd.Series(np.asarray(y), index=col.index)
-        rho = pd.Series(s).corr(yy, method="spearman")
-        if pd.isna(rho):
+        best_r, n = None, 0
+        for s in candidates(np.asarray(y)):
+            rho = pd.Series(s).corr(yy, method="spearman")
+            if pd.isna(rho):
+                continue
+            if best_r is None or abs(float(rho)) > abs(best_r):
+                best_r = float(rho)
+                n = int(min(pd.Series(s).notna().sum(), yy.notna().sum()))
+        if best_r is None:
             return None
-        n = int(min(pd.Series(s).notna().sum(), yy.notna().sum()))
+        rho = best_r
         # Fisher z for Spearman, mapped onto the same [0.5, 1] axis as AUC so
         # one set of thresholds covers both problem types.
         r = min(abs(float(rho)), 0.999999)
@@ -418,6 +460,11 @@ def _looks_like_id(col):
     if pd.api.types.is_float_dtype(col) or _is_timelike(col):
         return False  # a timestamp is unique per row but it is not an ID
     return True
+
+
+def _plain(v):
+    """Python scalar, so user-facing text never shows "np.int64(3)"."""
+    return getattr(v, "item", lambda: v)()
 
 
 def _fmt(v):
@@ -551,6 +598,14 @@ def analyse(df, target, split=None, group=None, ignore=()):
     check. Accepted columns are still reported, at info level, so a suppression
     stays visible instead of quietly hiding a later regression.
     """
+    dupes = sorted({str(c) for c in df.columns[df.columns.duplicated()]})
+    if dupes:
+        raise ValueError(
+            f"duplicate column name(s) in the data: {dupes}. Every check on "
+            "them silently fails, so a leak would be reported as clean. "
+            "Rename or drop the duplicates first - a bad join or "
+            "pd.concat(axis=1) is the usual cause.")
+
     if target not in df.columns:
         raise ValueError(f"target column {target!r} not in data: {list(df.columns)[:12]}")
     y = df[target]
@@ -642,7 +697,10 @@ def analyse(df, target, split=None, group=None, ignore=()):
                 "cannot be scored; flatten the column if it matters."))
 
     # --- dataset-level checks --------------------------------------------
-    dup = int(df.duplicated().sum()) if _hashable(df) else 0
+    try:
+        dup = int(df.duplicated().sum())
+    except TypeError:
+        dup = 0   # list/dict cells: nothing to compare, not a reason to die
     if dup:
         findings.append(Finding(
             "warning", "duplicate-rows", None,
@@ -672,15 +730,6 @@ def analyse(df, target, split=None, group=None, ignore=()):
     order = {"critical": 0, "warning": 1, "info": 2}
     findings.sort(key=lambda f: order[f.severity])
     return findings
-
-
-def _hashable(df):
-    """Cheap probe: duplicated() raises on unhashable cell values."""
-    try:
-        df.head(1).duplicated()
-        return True
-    except Exception:
-        return False
 
 
 def _safe_nunique(col):
@@ -718,17 +767,29 @@ def _column_findings(c, col, y, kind, n_features=1, varied_in_file=False):
         # either group has a single target value is not.
         for present in (True, False):
             grp = y[col.isna() != present]
-            if len(grp) >= MIN_CATEGORY_SUPPORT and grp.nunique() == 1 \
-                    and pd.Series(y).nunique() > 1:
-                state = "present" if present else "missing"
-                findings.append(Finding(
-                    "critical", "missingness-leak", c,
-                    f"wherever this column is {state} ({len(grp):,} rows) the "
-                    f"target is always {grp.iloc[0]!r}. It does not have to "
-                    "predict every row to give the answer away on the rows it "
-                    "does cover.",
-                    _evidence_missing(col, y, binary)))
-                break
+            if len(grp) < MIN_CATEGORY_SUPPORT or grp.nunique() != 1 \
+                    or pd.Series(y).nunique() <= 1:
+                continue
+            # "All 44 of these rows are negative" is not evidence when 99% of
+            # every row is negative - the probability of that under the null
+            # is 0.99^44 = 0.64. Without this test the check fired on 9 of 15
+            # pure-noise columns at a 1% base rate. p is the exact chance of a
+            # group this size landing on one class, Bonferroni'd over the
+            # columns tested.
+            rate = float((pd.Series(y) == grp.iloc[0]).mean())
+            p_null = rate ** len(grp)
+            if p_null * max(n_features, 1) > 0.01:
+                continue
+            state = "present" if present else "missing"
+            findings.append(Finding(
+                "critical", "missingness-leak", c,
+                f"wherever this column is {state} ({len(grp):,} rows) the "
+                f"target is always {_plain(grp.iloc[0])!r}, and that class is "
+                f"only {rate:.1%} of the data overall. It does not have to "
+                "predict every row to give the answer away on the rows it "
+                "does cover.",
+                _evidence_missing(col, y, binary)))
+            break
 
         na = _score_column(col.isna().astype(int), y, kind, n_features)
         if na and na["score"] >= AUC_WARN and na["z"] >= na["z_min"] \
@@ -907,6 +968,16 @@ def diagnose(train, val, baseline=0.5, metric="AUC"):
     """
     if not 0 <= baseline < 1:
         raise ValueError(f"baseline must be in [0, 1), got {baseline}")
+    for label, v in (("train", train), ("val", val)):
+        f = float(v)
+        # NaN slips through every comparison, and min(1.0, nan) returns 1.0 -
+        # a crashed fold or an empty metric log became "overfitting, 100% gap".
+        if f != f or f in (float("inf"), float("-inf")):
+            raise ValueError(f"{label} score is not a finite number: {v!r}")
+        if not -1.0 <= f <= 1.0:
+            raise ValueError(
+                f"{label} score {f} is outside [-1, 1]; pass the metric value, "
+                "not a percentage")
 
     def skill(s):
         """Fraction of the available headroom above chance that was captured."""

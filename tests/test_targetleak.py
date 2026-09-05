@@ -189,6 +189,144 @@ def test_dead_on_labelled_rows_outranks_a_plain_constant():
     assert by_kind["constant"].severity == "info"
 
 
+# --- bugs found by auditing the audited code ---------------------------------
+
+def test_null_se_uses_only_the_rows_actually_scored():
+    """`_auc` drops rows where the score is NaN, but the null SE was taken
+    from the full target. The two disagreed by exactly the column's
+    missingness, always in the anti-conservative direction: six observed
+    values among a thousand rows were reported as 27 SE above chance."""
+    rng = np.random.default_rng(0)
+    n = 1000
+    y = pd.Series(rng.integers(0, 2, n))
+    col = pd.Series(np.nan, index=range(n))
+    pos = np.flatnonzero(y.to_numpy() == 1)[:3]
+    neg = np.flatnonzero(y.to_numpy() == 0)[:3]
+    col[list(pos) + list(neg)] = [9.0, 8, 7, 3, 2, 1]   # perfect on 6 rows
+    m = tl._score_column(col, y, "binary")
+    assert m["score"] == 1.0, "should still separate perfectly"
+    assert m["z"] < 3.5, f"six rows cannot be 3.5 SE of evidence (z={m['z']})"
+    assert not [f for f in tl.analyse(pd.DataFrame({"c": col, "y": y}), "y")
+                if f.severity == "critical"]
+
+
+def test_subset_purity_must_beat_the_base_rate():
+    """'All 44 of these rows are negative' is not evidence when 99% of every
+    row is negative - P = 0.99^44 = 0.64. Without the test this fired on 9 of
+    15 pure-noise columns."""
+    rng = np.random.default_rng(5)
+    n = 3000
+    y = (rng.random(n) < 0.01).astype(int)          # 1% positive
+    data = {"y": y}
+    for i in range(15):
+        c = rng.normal(size=n)
+        c[rng.choice(n, 45, replace=False)] = np.nan   # MCAR, unrelated to y
+        data[f"sensor_{i}"] = c
+    hits = [f for f in tl.analyse(pd.DataFrame(data), "y")
+            if f.kind == "missingness-leak"]
+    assert not hits, [h.column for h in hits]
+
+
+def test_subset_purity_still_catches_a_real_one():
+    """The same gate must not blunt the Titanic-shaped leak it was built for."""
+    rng = np.random.default_rng(9)
+    n = 1300
+    y = (rng.random(n) > 0.38).astype(int)
+    body = np.full(n, np.nan)
+    body[np.flatnonzero(y == 0)[:121]] = rng.normal(size=121)
+    hits = [f for f in tl.analyse(
+        pd.DataFrame({"body": body, "f": rng.normal(size=n), "y": y}), "y")
+        if f.kind == "missingness-leak"]
+    assert len(hits) == 1 and hits[0].column == "body"
+
+
+@pytest.mark.parametrize("n", [2000, 9000, 12000])
+def test_integer_coded_categories_have_no_row_count_cliff(n):
+    """Codes 3 and 7 always mean y=1 - a non-monotonic leak that rank AUC
+    cannot see. Whether the column was target-encoded used to depend on
+    `nunique <= max(10, len//1000)`, so the SAME leak was caught at 12,000
+    rows and missed at 2,000, and caught as strings but missed as the int64
+    that read_csv actually hands you."""
+    rng = np.random.default_rng(0)
+    code = rng.integers(0, 12, n)
+    y = np.isin(code, [3, 7]).astype(int)
+    df = pd.DataFrame({"reason_code": code, "noise": rng.normal(size=n), "y": y})
+    assert "reason_code" in {f.column for f in tl.analyse(df, "y")
+                             if f.severity == "critical"}
+
+
+def test_integer_and_string_codings_agree():
+    rng = np.random.default_rng(0)
+    n = 2000
+    code = rng.integers(0, 12, n)
+    y = np.isin(code, [3, 7]).astype(int)
+    as_int = tl.analyse(pd.DataFrame({"c": code, "y": y}), "y")
+    as_str = tl.analyse(pd.DataFrame({"c": [f"R{v:02d}" for v in code],
+                                      "y": y}), "y")
+    sev = lambda out: {f.severity for f in out if f.column == "c"}  # noqa: E731
+    assert sev(as_int) == sev(as_str)
+
+
+def test_datetime_ordering_with_the_target_is_scored():
+    """Timestamps are not is_numeric_dtype, so they were target-encoded - and
+    every value is distinct, so the encoding returns the global mean and a
+    date that ranks perfectly with the target scored 0.5."""
+    n = 3000
+    y = (np.arange(n) > n * 0.6).astype(int)
+    df = pd.DataFrame({"resolved_at": pd.date_range("2024-01-01", periods=n,
+                                                    freq="h"), "y": y})
+    assert tl._score_column(df["resolved_at"], df["y"], "binary")["score"] > 0.9
+
+
+def test_duplicate_column_names_raise_rather_than_report_clean():
+    """df[c] returns a DataFrame, every check raises, and the per-column
+    handler swallowed it as info - so a duplicated perfect leak came back
+    'no leakage detected' with exit code 0."""
+    rng = np.random.default_rng(1)
+    y = rng.integers(0, 2, 600)
+    for cols in (["refund", "refund", "y"], ["a", "y", "y"]):
+        df = pd.DataFrame(np.c_[y * 5.0, y * 5.0, y], columns=cols)
+        with pytest.raises(ValueError, match="duplicate column name"):
+            tl.analyse(df, "y")
+
+
+def test_unhashable_cells_after_the_first_row():
+    """The hashability probe looked only at row 0, so a frame whose first row
+    is scalar and whose later rows hold lists passed it and then died."""
+    rng = np.random.default_rng(2)
+    n = 300
+    df = pd.DataFrame({"emb": [[1.0, 2.0]] * n, "f": rng.normal(size=n),
+                       "y": rng.integers(0, 2, n)})
+    df.loc[0, "emb"] = "scalar"
+    assert {f.kind for f in tl.analyse(df, "y")} >= {"unscoreable"}
+
+
+def test_reported_auc_does_not_depend_on_row_order():
+    """The positive class was `unique()[-1]` - order of appearance - while the
+    evidence table used sorted order. Shuffling the rows flipped the reported
+    AUC between 1.0000 and 0.0000, and the two halves of one report
+    contradicted each other."""
+    rng = np.random.default_rng(3)
+    seen = set()
+    for first in (0, 1):
+        y = np.array([first] + [1 - first] * 299 + [first] * 300)
+        df = pd.DataFrame({"x": y * 100.0 + rng.normal(0, .3, 600), "y": y})
+        f = next(q for q in tl.analyse(df, "y") if q.kind == "target-proxy")
+        seen.add(round(f.data["auc"], 6))
+    assert len(seen) == 1, f"AUC changed with row order: {seen}"
+
+
+@pytest.mark.parametrize("train,val", [
+    (float("nan"), 0.5), (0.9, float("nan")),
+    (float("inf"), 0.5), (1.4, 0.6), (0.9, -3.0),
+])
+def test_diagnose_rejects_impossible_scores(train, val):
+    """min(1.0, nan) is 1.0 in Python, so a NaN score produced a confident
+    diagnosis - and in opposite directions depending on which one was NaN."""
+    with pytest.raises(ValueError):
+        tl.diagnose(train, val)
+
+
 # --- statistical power: the flaw a reviewer would attack first ---------------
 
 @pytest.mark.parametrize("n", [20, 30, 50])
@@ -739,3 +877,35 @@ def test_cli_clean_data_exits_zero(tmp_path, capsys):
 def test_cli_requires_target_or_demo():
     with pytest.raises(SystemExit):
         tl.main(["somefile.csv"])
+
+
+# --- the benchmark is the README's evidence, so it gets tests too ------------
+
+def test_benchmark_runs_offline_and_reports_the_clean_datasets(capsys):
+    import importlib.util
+    import pathlib
+    spec = importlib.util.spec_from_file_location(
+        "bench", pathlib.Path(__file__).resolve().parents[1]
+        / "benchmark" / "run_benchmark.py")
+    bench = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bench)
+    assert bench.main(["--offline"]) == 0
+    out = capsys.readouterr().out
+    assert "false positives on clean data" in out
+    # The five sklearn datasets must actually have been measured.
+    for name in ("iris", "wine", "breast_cancer", "digits", "diabetes"):
+        assert name in out
+
+
+def test_benchmark_leak_kinds_match_the_report():
+    """The benchmark's recall metric and the report's verdict wording read
+    from two separate copies of this set. Adding a leak kind to one and not
+    the other silently degrades both."""
+    import importlib.util
+    import pathlib
+    spec = importlib.util.spec_from_file_location(
+        "bench2", pathlib.Path(__file__).resolve().parents[1]
+        / "benchmark" / "run_benchmark.py")
+    bench = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bench)
+    assert bench.LEAK_KINDS <= set(tl.FIXES), bench.LEAK_KINDS - set(tl.FIXES)
