@@ -1,0 +1,127 @@
+# Weekly robustness sweep over real public datasets.
+#
+# This exists to catch the failure nothing else watches: an upstream release
+# breaking the tool. Two of the eight correctness bugs found so far were pandas
+# version behaviour - `str` vs `object` dtype silently killed date detection on
+# every CSV while the test suite stayed green. CI only fires when someone
+# pushes, so a pandas 3.1 that changes something underneath us would go
+# unnoticed until a user hit it.
+#
+# So this deliberately installs the LATEST pandas and numpy rather than the
+# pinned versions, and runs against sixty real datasets. It is the one job in
+# this repository that is expected to break on its own one day; that is the
+# point of it.
+name: sweep
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"     # Mondays, 06:00 UTC
+  workflow_dispatch:         # and on demand
+
+permissions:
+  contents: read
+  issues: write              # to report what it finds
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Sixty OpenML downloads is the slow part, not the analysis.
+      - uses: actions/cache@v4
+        with:
+          path: ~/scikit_learn_data
+          key: openml-${{ hashFiles('benchmark/sweep.py') }}
+          restore-keys: openml-
+
+      - name: Install with the newest pandas and numpy
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+          pip install --upgrade pandas numpy      # deliberately unpinned
+          python -c "import pandas, numpy; print('pandas', pandas.__version__, 'numpy', numpy.__version__)"
+
+      - name: Unit tests against the newest pandas
+        id: tests
+        continue-on-error: true
+        run: pytest -q 2>&1 | tee test.log
+
+      - name: Benchmark
+        id: bench
+        continue-on-error: true
+        run: python benchmark/run_benchmark.py 2>&1 | tee bench.log
+
+      - name: Sweep
+        id: sweep
+        continue-on-error: true
+        run: python benchmark/sweep.py 2>&1 | tee sweep.log
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sweep-logs
+          path: |
+            test.log
+            bench.log
+            sweep.log
+
+      - name: Report anything that broke
+        if: always() && (steps.tests.outcome == 'failure' || steps.bench.outcome == 'failure' || steps.sweep.outcome == 'failure')
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const read = f => { try { return fs.readFileSync(f, 'utf8'); } catch { return '(no output)'; } };
+            const tail = (s, n) => s.split('\n').slice(-n).join('\n');
+            const failed = [
+              ['unit tests', '${{ steps.tests.outcome }}'],
+              ['benchmark', '${{ steps.bench.outcome }}'],
+              ['sweep', '${{ steps.sweep.outcome }}'],
+            ].filter(([, o]) => o === 'failure').map(([n]) => n);
+
+            const {owner, repo} = context.repo;
+            const versions = read('sweep.log').split('\n')[0];
+            const body = [
+              '<!-- weekly-sweep -->',
+              `The weekly sweep failed: **${failed.join(', ')}**.`,
+              '',
+              'This job runs against the newest pandas and numpy on purpose, so a',
+              'failure here usually means either an upstream release changed',
+              'behaviour underneath us, or a real dataset shape the tests do not',
+              'cover. Full logs are attached to',
+              `[run ${context.runId}](https://github.com/${owner}/${repo}/actions/runs/${context.runId}).`,
+              '',
+              '<details><summary>sweep tail</summary>', '',
+              '```', tail(read('sweep.log'), 40), '```', '', '</details>',
+              '',
+              '<details><summary>tests tail</summary>', '',
+              '```', tail(read('test.log'), 30), '```', '', '</details>',
+            ].join('\n');
+
+            // One issue, updated - not a fresh one every Monday for the same
+            // breakage, which is how a bot gets muted.
+            const open = await github.paginate(github.rest.issues.listForRepo,
+              {owner, repo, state: 'open', per_page: 100});
+            const mine = open.find(i => i.body && i.body.includes('<!-- weekly-sweep -->'));
+            if (mine) {
+              await github.rest.issues.createComment(
+                {owner, repo, issue_number: mine.number, body});
+            } else {
+              await github.rest.issues.create({
+                owner, repo,
+                title: 'Weekly sweep is failing',
+                body,
+              });
+            }
+
+      - name: Fail the run if anything broke
+        if: steps.tests.outcome == 'failure' || steps.bench.outcome == 'failure' || steps.sweep.outcome == 'failure'
+        run: exit 1

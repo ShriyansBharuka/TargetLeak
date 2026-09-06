@@ -39,8 +39,14 @@ AUC_WARN = 0.90
 # but it is the difference between reporting noise and not.
 Z_TABLE = ((10, 3.5), (100, 4.0), (1000, 4.5))
 Z_MAX = 5.0
-# Above this many distinct values a non-numeric target cannot be handled.
-MAX_CLASSES = 20
+# Ceiling on classification targets. This was 20, which refused 26-class
+# letter recognition outright - a mainstream problem, called "neither a
+# classification target nor a numeric one". The real question is not the class
+# count but whether each class has enough rows to say anything about: 26
+# letters in 20,000 rows is 769 each and perfectly fine, while 100 distinct
+# strings in 100 rows is free text someone pointed at the wrong column.
+MAX_CLASSES = 100
+MIN_ROWS_PER_CLASS = 10
 # Above this share of unique values a column is an identifier, not a feature.
 ID_UNIQUE_RATIO = 0.95
 # Categories rarer than this are ignored when judging purity -- a category with
@@ -292,7 +298,7 @@ def _target_kind(y):
         return "binary"
     if pd.api.types.is_numeric_dtype(s) and n > MAX_CLASSES:
         return "continuous"
-    if n <= MAX_CLASSES:
+    if n <= MAX_CLASSES and len(s) >= n * MIN_ROWS_PER_CLASS:
         return "multiclass"
     return "unsupported"
 
@@ -783,11 +789,15 @@ def analyse(df, target, split=None, group=None, ignore=()):
             f"target column {target!r} has fewer than 2 distinct values - "
             "there is nothing to predict.")
     if kind == "unsupported":
+        n_cls = int(y.dropna().nunique())
         raise ValueError(
-            f"target column {target!r} is non-numeric with "
-            f"{y.dropna().nunique():,} distinct values. That is neither a "
-            f"classification target (<= {MAX_CLASSES} classes) nor a numeric "
-            "one. Encode it, or point --target at the right column.")
+            f"target column {target!r} has {n_cls:,} distinct non-numeric "
+            f"values across {int(y.notna().sum()):,} labelled rows "
+            f"({y.notna().sum() / max(n_cls, 1):.1f} per class). That is too "
+            f"thin to treat as classification - the ceiling is {MAX_CLASSES} "
+            f"classes with at least {MIN_ROWS_PER_CLASS} rows each. If this is "
+            "free text or an identifier, point --target at the right column; "
+            "if it really is the label, group the rare classes first.")
     binary = kind == "binary"
     findings = []
     skip = {target} | ({split} if split else set())

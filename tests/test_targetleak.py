@@ -435,10 +435,39 @@ def test_multiclass_one_vs_rest_names_the_class():
 
 
 def test_unsupported_target_raises_instead_of_guessing():
+    """100 distinct strings in 100 rows is free text pointed at the wrong
+    column, not a 100-class problem."""
     df = pd.DataFrame({"x": range(100),
                        "t": [f"free text {i}" for i in range(100)]})
-    with pytest.raises(ValueError, match="distinct values"):
+    with pytest.raises(ValueError, match="too thin to treat as classification"):
         tl.analyse(df, "t")
+
+
+@pytest.mark.parametrize("n_classes", [10, 26, 60])
+def test_many_class_targets_are_supported(n_classes):
+    """A 20-class ceiling refused 26-class letter recognition outright, calling
+    it "neither a classification target nor a numeric one". The class count is
+    not the question - rows per class is. Found by the dataset sweep."""
+    rng = np.random.default_rng(0)
+    n = n_classes * 400
+    y = rng.integers(0, n_classes, n)
+    labels = pd.Series([chr(65 + (v % 26)) + str(v // 26) for v in y])
+    df = pd.DataFrame({"leak": y * 3.0 + rng.normal(0, .05, n),
+                       "noise": rng.normal(size=n), "t": labels})
+    out = tl.analyse(df, "t")
+    assert any("multiclass" in f.detail for f in out if f.kind == "target")
+    crit = {f.column for f in out if f.severity == "critical"}
+    assert "leak" in crit and "noise" not in crit
+
+
+def test_a_class_with_too_few_rows_is_refused_with_the_arithmetic():
+    """The error has to say why, so the user can act on it."""
+    df = pd.DataFrame({"x": range(300),
+                       "t": [f"cls{i % 90}" for i in range(300)]})
+    with pytest.raises(ValueError) as e:
+        tl.analyse(df, "t")
+    msg = str(e.value)
+    assert "per class" in msg and "group the rare classes" in msg
 
 
 def test_single_valued_target_raises():
