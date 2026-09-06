@@ -51,6 +51,18 @@ FOLDS = 5
 # analytic SE does not apply. Only spent on columns that already cleared the
 # score threshold, so this is per-candidate, not per-column.
 PERMUTATIONS = 60
+# Permutation calibration lowers the encoded z by roughly a fifth, so when the
+# analytic z is already several times the bar the measured one cannot change
+# the verdict. Skipping it there took a 452-row x 280-column frame from 32s to
+# a couple of seconds - the cost was per candidate, and wide frames have many.
+CALIBRATE_BELOW = 3.0
+# The dataset is easy rather than leaky above this share of columns being
+# individually predictive - AND this many of them in absolute terms. The share
+# alone misfires on narrow frames: two leaks among six columns is 33% and is
+# the perfectly ordinary case this note must not reframe. The note exists to
+# defuse a wall of a hundred findings, and two is not a wall.
+WIDESPREAD_SHARE = 0.25
+WIDESPREAD_MIN = 8
 
 
 # Finding a leak is half the job. Naming the leak without saying what to do
@@ -111,6 +123,14 @@ FIXES = {
         "a constant. Until that is fixed the feature contributes nothing, and "
         "any conclusion that 'the signal is not there' was measured without "
         "it.",
+    "widespread-separability":
+        "Do not work through these one by one. When this many columns are each "
+        "predictive on their own, the usual explanation is that the problem is "
+        "genuinely easy - engineered features for image or signal "
+        "classification look exactly like this - not that the data is riddled "
+        "with leaks. Leakage concentrates: one or two columns carrying the "
+        "answer, not a hundred. Check the two or three strongest by hand, "
+        "confirm they exist at prediction time, and ignore the tail.",
     "unscoreable":
         "Flatten or encode the column if it matters - one value per cell. "
         "Otherwise ignore this: the column was skipped, nothing else was.",
@@ -296,6 +316,35 @@ def _oof_target_encode(col, y, folds=FOLDS, seed=0):
     out = np.full(len(col), np.nan)
     ys = pd.Series(yv)
     known = codes >= 0
+
+    # A one-vs-rest target is a 0/1 indicator, and a multiclass frame asks for
+    # one encoding per class per column - 856 columns x 9 classes x 5 folds was
+    # 38,520 groupby calls and 58% of the runtime on a real dataset.
+    #
+    # For an indicator the fold loop collapses to arithmetic: subtract each
+    # fold's sums from the totals. That is normally unsafe here, because
+    # pandas' group_mean uses Kahan compensated summation and np.bincount does
+    # not, so a continuous target drifts by ~1e-16. An indicator cannot drift -
+    # its group sums are whole numbers held exactly in float64 - so the
+    # shortcut is bit-exact for exactly this case, and the continuous case
+    # keeps the groupby path below.
+    finite = yv[np.isfinite(yv)]
+    if ncat and len(finite) and np.array_equal(finite, finite.astype(bool)):
+        kc, ky = codes[known], yv[known]
+        kf = fold[known]
+        tot_sum = np.bincount(kc, weights=ky, minlength=ncat)
+        tot_cnt = np.bincount(kc, minlength=ncat).astype(float)
+        for f in range(folds):
+            sel = kf == f
+            f_sum = np.bincount(kc[sel], weights=ky[sel], minlength=ncat)
+            f_cnt = np.bincount(kc[sel], minlength=ncat).astype(float)
+            n_tr = tot_cnt - f_cnt
+            with np.errstate(invalid="ignore", divide="ignore"):
+                lut = np.where(n_tr > 0, (tot_sum - f_sum) / n_tr, np.nan)
+            te = known & (fold == f)
+            out[te] = lut[codes[te]]
+        return pd.Series(out, index=col.index).fillna(ys.mean())
+
     for f in range(folds if ncat else 0):
         tr = known & (fold != f)
         means = ys[tr].groupby(codes[tr], sort=False).mean()
@@ -369,7 +418,7 @@ def _score_column(col, y, kind, n_features=1, n_unique=None):
                                    int((used == 0).sum()))
         z = (best_sep - 0.5) / best_se if best_se not in (0, float("inf")) else 0.0
 
-        if best_encoded and best_sep >= AUC_WARN:
+        if best_encoded and best_sep >= AUC_WARN and z < CALIBRATE_BELOW * zmin:
             # The analytic SE assumes the scores were fixed before the target
             # was seen, which is false for an encoding built from it. Measure
             # the null instead - only for a column that already cleared the
@@ -395,7 +444,13 @@ def _score_column(col, y, kind, n_features=1, n_unique=None):
                 "z": z, "z_min": zmin}
 
     if kind == "multiclass":
-        # One-vs-rest: a leak only has to give away one class.
+        # One-vs-rest keeps the best of K classes, so this column consumes K
+        # tests rather than one and the Bonferroni count has to say so. Under
+        # the null the max score climbs with K - 0.517 at 2 classes, 0.589 at
+        # 16 - which is real inflation even though it did not reach the score
+        # gate at the sizes measured.
+        n_cls = int(pd.Series(y).dropna().nunique())
+        zmin = _z_min(max(n_features, 1) * max(n_cls, 1))
         best, best_auc, best_z, best_cls = 0.5, None, 0.0, None
         for cls in sorted(pd.Series(y).dropna().unique(), key=repr):
             ind = (pd.Series(y) == cls).astype(int).to_numpy()
@@ -457,7 +512,7 @@ def _score_column(col, y, kind, n_features=1, n_unique=None):
         score = 0.5 + r / 2
         z = (0.5 * np.log((1 + r) / (1 - r)) * np.sqrt(max(n - 3, 1) / 1.06)
              if n > 3 else 0.0)
-        if best_encoded and score >= AUC_WARN:
+        if best_encoded and score >= AUC_WARN and z < CALIBRATE_BELOW * zmin:
             # Same reason as the binary path: Fisher-z assumes the predictor
             # was not built from the target.
             yv = np.asarray(y)
@@ -839,6 +894,21 @@ def analyse(df, target, split=None, group=None, ignore=()):
                     "time, the model trains on the future to predict the past."))
         except Exception:
             pass
+
+    separable = {f.column for f in findings
+                 if f.column and f.severity in ("critical", "warning")
+                 and f.kind in ("target-proxy", "suspiciously-predictive",
+                                "pure-categories")}
+    if (len(separable) >= WIDESPREAD_MIN and scored_features
+            and len(separable) / len(scored_features) >= WIDESPREAD_SHARE):
+        share = len(separable) / len(scored_features)
+        findings.append(Finding(
+            "warning", "widespread-separability", None,
+            f"{len(separable)} of {len(scored_features)} columns "
+            f"({share:.0%}) are individually predictive of the target. That is "
+            "the signature of an easy problem rather than a leaking one - a "
+            "leak is normally one or two columns, not this many. Read the "
+            "strongest few and treat the rest as the dataset working."))
 
     for c in sorted(ignore & set(features)):
         findings.append(Finding(

@@ -140,6 +140,7 @@ data never leaves your runner; only the findings reach the comment.
 | `constant` | Features carrying no information at all |
 | `dead-on-labelled-rows` | Features that vary in the file but not on labelled rows |
 | `underpowered` | Scores too high to ignore but on too little data to trust |
+| `widespread-separability` | So many columns are predictive that the problem is easy, not leaky |
 
 Binary, multiclass (one-vs-rest) and continuous targets. CSV, TSV, Parquet.
 

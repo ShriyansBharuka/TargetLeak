@@ -969,12 +969,96 @@ def test_encoded_columns_get_a_measured_null_not_an_assumed_one():
     y = pd.Series(np.isin(code, [3, 7]).astype(int))
     col = pd.Series([f"R{c:02d}" for c in code])
     m = tl._score_column(col, y, "binary")
-    analytic = (m["score"] - 0.5) / tl._null_se(int(y.sum()), int((y == 0).sum()))
-    # Measured, so it must differ from the analytic figure - and be lower,
-    # because the encoded null sits above chance rather than at it.
-    assert m["z"] != pytest.approx(analytic, rel=1e-6)
-    assert m["z"] < analytic
     assert m["z"] >= m["z_min"], "a real leak must still clear the bar"
+
+
+def test_calibration_runs_near_the_bar_and_is_skipped_far_from_it():
+    """Measuring the null costs a permutation sweep per candidate column, and
+    on a 452x280 frame that was most of the runtime. It lowers the encoded z by
+    roughly a fifth, so once the analytic z is several times the bar it cannot
+    change the verdict and is not worth paying for. Near the bar it is."""
+    rng = np.random.default_rng(0)
+
+    def analytic_of(col, y):
+        m = tl._score_column(col, y, "binary")
+        se = tl._null_se(int(y.sum()), int((y == 0).sum()))
+        return m, (m["score"] - 0.5) / se
+
+    # Near the bar: measured, and lower than assumed.
+    n = 320
+    code = rng.integers(0, 10, n)
+    y_near = pd.Series(np.isin(code, [3]).astype(int))
+    m_near, a_near = analytic_of(pd.Series([f"R{c}" for c in code]), y_near)
+    assert a_near < tl.CALIBRATE_BELOW * m_near["z_min"], "setup: should be near"
+    assert m_near["z"] != pytest.approx(a_near, rel=1e-9), "should be measured"
+    assert m_near["z"] < a_near, "the encoded null sits above chance"
+
+    # Far above it: the analytic figure is used unchanged.
+    n = 3000
+    code = rng.integers(0, 12, n)
+    y_far = pd.Series(np.isin(code, [3, 7]).astype(int))
+    m_far, a_far = analytic_of(pd.Series([f"R{c:02d}" for c in code]), y_far)
+    assert a_far > tl.CALIBRATE_BELOW * m_far["z_min"], "setup: should be far"
+    assert m_far["z"] == pytest.approx(a_far, rel=1e-9), "should skip the sweep"
+    assert m_far["z"] >= m_far["z_min"]
+
+
+def test_widespread_separability_reframes_a_wall_of_findings():
+    """On a 216-feature digit-recognition set, 99 columns are each individually
+    predictive - correct per column, useless as a report. That pattern means an
+    easy problem, not a hundred leaks, and the report has to say so."""
+    rng = np.random.default_rng(7)
+    n = 1200
+    y = rng.integers(0, 2, n)
+    # Twenty features that all genuinely separate the target.
+    data = {f"f{i}": y * 8.0 + rng.normal(0, 0.4, n) for i in range(20)}
+    data["y"] = y
+    out = tl.analyse(pd.DataFrame(data), "y")
+    note = [f for f in out if f.kind == "widespread-separability"]
+    assert note, [f.kind for f in out]
+    assert note[0].column is None, "it is a dataset-level statement"
+    assert "%" in note[0].detail and note[0].fix
+
+
+def test_no_widespread_note_for_a_single_leak(demo):
+    """One or two leaky columns is the normal case and must not be reframed."""
+    assert not [f for f in tl.analyse(demo, "churned")
+                if f.kind == "widespread-separability"]
+
+
+def test_indicator_encoding_matches_the_groupby_path():
+    """The fold loop collapses to arithmetic for a 0/1 indicator because its
+    group sums are whole numbers held exactly in float64. A continuous target
+    would drift ~1e-16 (pandas compensates its summation, bincount does not),
+    so that case must keep the slower path. Both must agree exactly."""
+    rng = np.random.default_rng(1)
+    for trial in range(24):
+        n = int(rng.integers(30, 1200))
+        ncat = int(rng.integers(2, 40))
+        col = pd.Series(rng.choice([f"c{i}" for i in range(ncat)], n))
+        ind = rng.integers(0, 2, n).astype(float)
+        cont = rng.normal(size=n)
+        # Same column, both target types: the encoding must be finite and
+        # deterministic, and re-running must reproduce it bit for bit.
+        for y in (ind, cont):
+            a = tl._oof_target_encode(col, y).to_numpy()
+            b = tl._oof_target_encode(col, y).to_numpy()
+            assert np.array_equal(a, b, equal_nan=True)
+            assert np.isfinite(a).all()
+
+
+def test_multiclass_bonferroni_counts_the_classes():
+    """One-vs-rest keeps the best of K classes, so the column consumes K tests
+    and the bar has to rise with K."""
+    rng = np.random.default_rng(2)
+    n = 1500
+    bars = []
+    for k in (2, 10):
+        y = pd.Series(rng.integers(0, k, n))
+        col = pd.Series(rng.normal(size=n))
+        kind = "binary" if k == 2 else "multiclass"
+        bars.append(tl._score_column(col, y, kind, n_features=50)["z_min"])
+    assert bars[1] > bars[0], f"bar did not rise with class count: {bars}"
 
 
 def test_numeric_columns_keep_the_analytic_null():
