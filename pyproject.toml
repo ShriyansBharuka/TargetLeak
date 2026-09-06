@@ -4,9 +4,10 @@ build-backend = "hatchling.build"
 
 [project]
 name = "targetleak"
-version = "0.1.0"
+version = "0.1.1"
 description = "Find data leakage in a training set before it fools you."
 readme = "README.md"
+authors = [{ name = "Shriyans Bharuka" }]
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.10"
@@ -28,6 +29,14 @@ dependencies = [
     "pandas>=2.0",
     "numpy>=1.23",
 ]
+
+[project.urls]
+# Without these the PyPI page has no link back to the source, which is most of
+# the point of publishing it.
+Homepage = "https://github.com/ShriyansBharuka/TargetLeak"
+Repository = "https://github.com/ShriyansBharuka/TargetLeak"
+Issues = "https://github.com/ShriyansBharuka/TargetLeak/issues"
+Changelog = "https://github.com/ShriyansBharuka/TargetLeak/releases"
 
 [project.optional-dependencies]
 parquet = ["pyarrow>=10.0"]

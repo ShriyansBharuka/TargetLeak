@@ -24,7 +24,7 @@ import sys
 import numpy as np
 import pandas as pd
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 __all__ = ["analyse", "diagnose", "report", "to_html", "fix_code", "Finding",
            "FIXES", "demo_frame", "load", "main"]
 
