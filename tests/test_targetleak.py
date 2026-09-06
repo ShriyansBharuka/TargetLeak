@@ -439,7 +439,7 @@ def test_unsupported_target_raises_instead_of_guessing():
     column, not a 100-class problem."""
     df = pd.DataFrame({"x": range(100),
                        "t": [f"free text {i}" for i in range(100)]})
-    with pytest.raises(ValueError, match="too thin to treat as classification"):
+    with pytest.raises(ValueError, match="free text or an identifier"):
         tl.analyse(df, "t")
 
 
@@ -460,14 +460,27 @@ def test_many_class_targets_are_supported(n_classes):
     assert "leak" in crit and "noise" not in crit
 
 
-def test_a_class_with_too_few_rows_is_refused_with_the_arithmetic():
-    """The error has to say why, so the user can act on it."""
-    df = pd.DataFrame({"x": range(300),
+def test_thin_classes_are_analysed_not_refused():
+    """A rows-per-class floor refused 24-class audiology by 0.6 of a row,
+    because a mean is the wrong statistic on a skewed class distribution -
+    audiology's classes are 57, 48, 22, 22, 20, 9, so the large ones had
+    ample support. Thin support is what the power gate is for; refusing the
+    whole file duplicates its job with a blunter instrument."""
+    rng = np.random.default_rng(0)
+    df = pd.DataFrame({"x": rng.normal(size=300),
                        "t": [f"cls{i % 90}" for i in range(300)]})
+    out = tl.analyse(df, "t")            # must not raise
+    assert any("multiclass" in f.detail for f in out if f.kind == "target")
+
+
+def test_a_target_that_is_free_text_still_says_why():
+    """The refusal has to give the user something to act on."""
+    df = pd.DataFrame({"x": range(200),
+                       "t": [f"note {i}" for i in range(200)]})
     with pytest.raises(ValueError) as e:
         tl.analyse(df, "t")
     msg = str(e.value)
-    assert "per class" in msg and "group the rare classes" in msg
+    assert "distinct value" in msg and "--target" in msg
 
 
 def test_single_valued_target_raises():
@@ -1175,3 +1188,140 @@ def test_pd_na_in_a_nullable_target_is_not_the_negative_class():
                            "pure-categories", "missingness-leak")}
     assert "cohort" not in leaky, leaky
     assert any(f.kind == "target-mostly-null" for f in out)
+
+
+# --- one fix for five findings: content, not storage -------------------------
+# Found by a ten-round sweep across ~100 real public datasets. Each of these
+# was a decision about a column made from its dtype rather than its values.
+
+def test_a_numeric_column_stored_as_category_scores_the_same(tmp_path):
+    """F10, the worst of the five. OpenML ships anneal.formability as a
+    `category` of the strings '1'..'4'; read_csv gives float64. The candidate
+    set branched on that, so a category column got only the target encoding
+    and the identical float got only rank AUC. Measured across 36 real
+    datasets it changed the findings on 11% of them, and on dermatology it
+    moved the verdict from 7 critical leaks to 11."""
+    rng = np.random.default_rng(0)
+    n = 900
+    y = rng.integers(0, 2, n)
+    vals = np.where(y == 1, 3, rng.integers(0, 3, n))
+    frames = {
+        "numeric": pd.Series(vals.astype(float)),
+        "category": pd.Series([str(v) for v in vals]).astype("category"),
+        "string": pd.Series([str(v) for v in vals]).astype("string"),
+        "object": pd.Series([str(v) for v in vals]).astype("object"),
+    }
+    scores = {}
+    for label, col in frames.items():
+        df = pd.DataFrame({"c": col, "noise": rng.normal(size=n), "y": y})
+        out = tl.analyse(df, "y")
+        scores[label] = sorted((f.severity, f.kind, f.column) for f in out)
+    first = scores["numeric"]
+    for label, sig in scores.items():
+        assert sig == first, f"{label} disagrees with numeric:\n{sig}\n{first}"
+
+
+def test_findings_survive_a_csv_round_trip_for_numeric_categories(tmp_path):
+    rng = np.random.default_rng(1)
+    n = 800
+    y = rng.integers(0, 2, n)
+    df = pd.DataFrame({
+        "coded": pd.Series([str(v) for v in np.where(y == 1, 7, 2)]).astype("category"),
+        "noise": rng.normal(size=n),
+        "y": y,
+    })
+    p = tmp_path / "rt.csv"
+    df.to_csv(p, index=False)
+    sig = lambda o: sorted((f.severity, f.kind, f.column) for f in o)  # noqa: E731
+    assert sig(tl.analyse(df, "y")) == sig(tl.analyse(tl.load(p), "y"))
+
+
+@pytest.mark.parametrize("distinct,expected", [
+    (2, "binary"), (10, "multiclass"), (15, "multiclass"),
+    (16, "continuous"), (56, "continuous"), (98, "continuous"),
+])
+def test_numeric_target_kind_turns_on_order_not_a_class_ceiling(distinct, expected):
+    """F4. A numeric target with many distinct values is a measurement whose
+    ORDER is information. cpu_act's 56-value CPU percentage was read as 56
+    unordered classes and produced 4 false criticals; us_crime's float64
+    crime rate with 98 distinct values got the same treatment."""
+    rng = np.random.default_rng(2)
+    n = distinct * 60
+    y = pd.Series(rng.integers(0, distinct, n).astype(float))
+    assert tl._target_kind(y) == expected
+
+
+def test_numeric_percentage_target_produces_no_false_criticals():
+    """cpu_act's shape: an integer percentage with dozens of levels."""
+    rng = np.random.default_rng(3)
+    n = 8000
+    usr = rng.integers(0, 100, n).astype(float)
+    df = pd.DataFrame({"a": usr * 0.4 + rng.normal(0, 25, n),
+                       "b": rng.normal(size=n), "usr": usr})
+    assert tl._target_kind(df["usr"]) == "continuous"
+    assert not [f for f in tl.analyse(df, "usr") if f.severity == "critical"]
+
+
+def test_a_normalised_float_is_not_a_discrete_flag():
+    """F9. The discrete-predictor branch fired for anything with up to 100
+    distinct values, so 120 of us_crime's 126 normalised floats each became a
+    100-group one-vs-rest comparison - 111 underpowered findings and no usable
+    verdict. The branch exists for genuine flags and handfuls of codes."""
+    rng = np.random.default_rng(4)
+    n = 2000
+    y = pd.Series(rng.normal(size=n))
+    # 60 distinct values: a rounded measurement, not a flag.
+    col = pd.Series(np.round(rng.random(n), 2) * 0.6 + 0.2)
+    m = tl._score_column(col, y, "continuous")
+    assert "Spearman" in m["metric"], m["metric"]
+
+
+def test_a_genuine_flag_still_uses_group_separation():
+    """The other side of F9: two-level predictors must keep the branch that
+    catches a flag marking the top slice of a continuous target."""
+    rng = np.random.default_rng(5)
+    n = 4000
+    rev = rng.lognormal(3, 1, n)
+    flag = np.zeros(n)
+    flag[np.argsort(-rev)[:80]] = 1.0          # top 2%
+    m = tl._score_column(pd.Series(flag), pd.Series(rev), "continuous")
+    assert m["score"] >= tl.AUC_CRITICAL, m
+    assert "Spearman" not in m["metric"]
+
+
+def test_four_digit_numbers_are_not_dates():
+    """F11. cylinder-bands.plating_tank holds tank numbers '1910', '1911'.
+    Stored as strings those parse as years, so the column earned a
+    temporal-column warning whose remediation told the user to sort and split
+    by it."""
+    rng = np.random.default_rng(6)
+    n = 600
+    tanks = pd.Series([str(v) for v in rng.integers(1900, 1930, n)])
+    df = pd.DataFrame({"plating_tank": tanks.astype("category"),
+                       "y": rng.integers(0, 2, n)})
+    assert not [f for f in tl.analyse(df, "y") if f.kind == "temporal-column"]
+    # ...but a real date column must still be caught.
+    df2 = pd.DataFrame({"seen_at": pd.date_range("2024-01-01", periods=n, freq="h")
+                        .astype(str), "y": rng.integers(0, 2, n)})
+    assert [f for f in tl.analyse(df2, "y") if f.kind == "temporal-column"]
+
+
+def test_mixed_columns_keep_their_own_representation():
+    """Only convert when EVERY present value is numeric - otherwise the
+    strings mean something."""
+    col = pd.Series(["1", "2", "unknown", "4", None])
+    assert not pd.api.types.is_numeric_dtype(tl._as_content(col))
+    assert pd.api.types.is_numeric_dtype(tl._as_content(pd.Series(["1", "2", None])))
+
+
+def test_analyse_does_not_mutate_the_callers_frame():
+    """Normalisation happens on a copy; a library must not rewrite the
+    dtypes of a frame the caller still holds."""
+    rng = np.random.default_rng(7)
+    n = 400
+    df = pd.DataFrame({"c": pd.Series([str(v) for v in rng.integers(0, 5, n)]
+                                      ).astype("category"),
+                       "y": rng.integers(0, 2, n)})
+    before = str(df["c"].dtype)
+    tl.analyse(df, "y")
+    assert str(df["c"].dtype) == before == "category"

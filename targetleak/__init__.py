@@ -39,14 +39,22 @@ AUC_WARN = 0.90
 # but it is the difference between reporting noise and not.
 Z_TABLE = ((10, 3.5), (100, 4.0), (1000, 4.5))
 Z_MAX = 5.0
-# Ceiling on classification targets. This was 20, which refused 26-class
-# letter recognition outright - a mainstream problem, called "neither a
-# classification target nor a numeric one". The real question is not the class
-# count but whether each class has enough rows to say anything about: 26
-# letters in 20,000 rows is 769 each and perfectly fine, while 100 distinct
-# strings in 100 rows is free text someone pointed at the wrong column.
+# Ceiling on how many LABELS a non-numeric target may have. 26-class letter
+# recognition is a mainstream problem and was once refused outright.
 MAX_CLASSES = 100
-MIN_ROWS_PER_CLASS = 10
+# A NUMERIC column with only a handful of distinct values is plausibly coded
+# classes; beyond that its ORDER is information, and shredding it into
+# one-vs-rest groups throws away the thing that makes it a number. This is the
+# distinction MAX_CLASSES was being asked to make and could not - it applies
+# to targets (a 56-value CPU percentage was read as 56 unordered classes) and
+# to predictors alike (120 of us_crime's 126 normalised floats were read as
+# discrete flags, producing 111 findings and no usable verdict).
+NUMERIC_CLASS_MAX = 15
+# Above this share of distinct values a target is not a label at all - it is
+# free text or an identifier pointed at the wrong column. Replaces a
+# rows-per-class floor that refused 24-class audiology by 0.6 of a row,
+# because a mean is the wrong statistic on a skewed class distribution.
+TARGET_CARDINALITY_MAX = 0.5
 # Above this share of unique values a column is an identifier, not a feature.
 ID_UNIQUE_RATIO = 0.95
 # Categories rarer than this are ignored when judging purity -- a category with
@@ -282,6 +290,60 @@ def _empirical_z(observed, resample, k=PERMUTATIONS, floor=1e-9):
     return float((observed - sims.mean()) / max(sd, floor))
 
 
+def _as_content(col):
+    """Represent a column by what it CONTAINS, not by how it is stored.
+
+    This is one fix for five findings, all of which were the same mistake:
+    a decision about a column being made from its dtype.
+
+    OpenML ships `anneal.formability` as a `category` holding the strings
+    '1'..'4'; `read_csv` gives the identical data as float64. Every decision
+    downstream branched on that difference - which candidates to score,
+    whether the column counted as discrete, whether it looked like a date - so
+    the same file produced different findings depending on how it was loaded.
+    Measured across 36 real datasets that changed the findings on 11% of them,
+    and on `dermatology` it moved the verdict from 7 critical leaks to 11.
+
+    It also fixes a false positive: `cylinder-bands.plating_tank` holds tank
+    numbers '1910', '1911'. As strings those parse as years, so the column
+    earned a `temporal-column` warning telling the user to sort and split by
+    it. As numbers they are numbers.
+
+    Only converted when EVERY present value is numeric. A mixed column keeps
+    its own representation, because then the strings mean something.
+    """
+    if (pd.api.types.is_numeric_dtype(col)
+            or pd.api.types.is_datetime64_any_dtype(col)
+            or pd.api.types.is_bool_dtype(col)):
+        return col
+    try:
+        as_num = pd.to_numeric(col, errors="coerce")
+    except (TypeError, ValueError):
+        return col
+    present = int(col.notna().sum())
+    if present and int(as_num.notna().sum()) == present:
+        return as_num
+    return col
+
+
+def _normalise(df):
+    """Apply `_as_content` across a frame without mutating the caller's."""
+    changed = {}
+    for c in df.columns:
+        try:
+            fixed = _as_content(df[c])
+        except Exception:
+            continue
+        if fixed is not df[c]:
+            changed[c] = fixed
+    if not changed:
+        return df
+    out = df.copy(deep=False)      # shares data; copy-on-write per column
+    for c, v in changed.items():
+        out[c] = v
+    return out
+
+
 def _target_kind(y):
     """binary | multiclass | continuous | degenerate | unsupported.
 
@@ -296,9 +358,10 @@ def _target_kind(y):
         return "degenerate"
     if n == 2:
         return "binary"
-    if pd.api.types.is_numeric_dtype(s) and n > MAX_CLASSES:
-        return "continuous"
-    if n <= MAX_CLASSES and len(s) >= n * MIN_ROWS_PER_CLASS:
+    if pd.api.types.is_numeric_dtype(s):
+        # Order is information. Only a handful of distinct values reads as codes.
+        return "multiclass" if n <= NUMERIC_CLASS_MAX else "continuous"
+    if n <= MAX_CLASSES and n / len(s) < TARGET_CARDINALITY_MAX:
         return "multiclass"
     return "unsupported"
 
@@ -486,7 +549,7 @@ def _score_column(col, y, kind, n_features=1, n_unique=None):
         # it lands on the same [0.5, 1] axis as every other check. The groups
         # are not derived from y, so the Hanley-McNeil null SE is valid here.
         n_vals = int(col.nunique(dropna=True)) if n_unique is None else n_unique
-        if n_vals <= MAX_CLASSES:
+        if n_vals <= NUMERIC_CLASS_MAX:
             best, best_z, best_lab = 0.5, 0.0, None
             for val in sorted(col.dropna().unique(), key=repr):
                 ind = (col == val).to_numpy().astype(int)
@@ -539,9 +602,23 @@ def _score_column(col, y, kind, n_features=1, n_unique=None):
 
 
 def _looks_categorical(col):
-    """Integer codes with few distinct values behave like categories, not scales."""
-    return (pd.api.types.is_integer_dtype(col)
-            and col.nunique(dropna=True) <= max(10, len(col) // 1000))
+    """Few distinct values behaves like a category, whatever the dtype.
+
+    Both halves of the previous rule - `is_integer_dtype(col) and nunique <=
+    max(10, len(col) // 1000)` - were storage or size standing in for content:
+
+    - The integer requirement made 1.0/2.0/3.0 behave differently from
+      1/2/3, which is the residue of the dtype bug this commit is about.
+    - The row-count term made the answer depend on how many rows sat
+      underneath. A 46-value state code counted as a category only above
+      ~46,000 rows; below that it was a "measurement" and the group-overlap
+      scan skipped it, which is why grouping us_crime by state cost 0.0385 of
+      real score with nothing reported (F7, still open - that check needs its
+      own fix, and this only removes one of its two causes).
+    """
+    if not pd.api.types.is_numeric_dtype(col):
+        return False
+    return col.nunique(dropna=True) <= NUMERIC_CLASS_MAX
 
 
 # Names that betray a column even when its correlation is mild. A 5-day forward
@@ -769,6 +846,10 @@ def analyse(df, target, split=None, group=None, ignore=()):
     check. Accepted columns are still reported, at info level, so a suppression
     stays visible instead of quietly hiding a later regression.
     """
+    # Decide from content, not storage - see _as_content. Done once here so
+    # every check below sees the same column whichever way the file was read.
+    df = _normalise(df)
+
     dupes = sorted({str(c) for c in df.columns[df.columns.duplicated()]})
     if dupes:
         raise ValueError(
@@ -790,14 +871,16 @@ def analyse(df, target, split=None, group=None, ignore=()):
             "there is nothing to predict.")
     if kind == "unsupported":
         n_cls = int(y.dropna().nunique())
+        n_lab = int(y.notna().sum())
         raise ValueError(
             f"target column {target!r} has {n_cls:,} distinct non-numeric "
-            f"values across {int(y.notna().sum()):,} labelled rows "
-            f"({y.notna().sum() / max(n_cls, 1):.1f} per class). That is too "
-            f"thin to treat as classification - the ceiling is {MAX_CLASSES} "
-            f"classes with at least {MIN_ROWS_PER_CLASS} rows each. If this is "
-            "free text or an identifier, point --target at the right column; "
-            "if it really is the label, group the rare classes first.")
+            f"values across {n_lab:,} labelled rows - "
+            f"{n_cls / max(n_lab, 1):.0%} of the rows hold a distinct value. "
+            f"That reads as free text or an identifier rather than a label "
+            f"(the ceiling is {MAX_CLASSES} classes, and fewer than "
+            f"{TARGET_CARDINALITY_MAX:.0%} of rows being distinct). Point "
+            "--target at the right column, or encode it if it really is the "
+            "label.")
     binary = kind == "binary"
     findings = []
     skip = {target} | ({split} if split else set())

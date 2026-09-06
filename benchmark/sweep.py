@@ -63,6 +63,62 @@ DATASETS = [
     ("cardiotocography", 1), ("PhishingWebsites", 1), ("banknote-authentication", 1),
     ("climate-model-simulation-crashes", 1), ("blood-transfusion-service-center", 1),
     ("MiceProtein", 1), ("wall-robot-navigation", 1), ("pc4", 1),
+
+    # Round 2 of the sweep loop. Each of these stresses something nothing in
+    # the list above reaches.
+    ("Bioresponse", 1),              # 1,776 columns - extreme width
+    ("Amazon_employee_access", 1),   # integer codes with thousands of levels
+    ("KDDCup09_appetency", 1),       # 231 columns, most of them mostly empty
+    ("isolet", 1),                   # 617 columns and 26 classes at once
+    ("har", 1),                      # 561 columns, sensor signals
+    ("anneal", 1),                   # heavy missingness across mixed dtypes
+    ("primary-tumor", 1),            # 22 classes on 339 rows - thin support
+    ("audiology", 1),                # 24 classes on 226 rows - thinner still
+    ("abalone", 1),                  # 29 ordered classes, borderline regression
+    ("cholesterol", 1),              # regression target with missing values
+
+    # Round 3. Biggest gap after 69 datasets: not one of them had a real date
+    # column, so _is_timelike and temporal-column have had almost no exposure
+    # outside frames I wrote. Then scale, then regression targets.
+    ("electricity", 1),              # has a genuine `date` column
+    ("covertype", 3),                # 581,012 rows - scale
+    ("poker-hand", 1),               # ~1M rows - more scale
+    ("wine_quality", 1),             # ordered classes, borderline regression
+    ("kin8nm", 1),                   # regression
+    ("cpu_act", 1),                  # regression, 22 columns
+    ("pol", 1),                      # regression, 49 columns
+    ("house_16H", 1),                # regression, skewed target
+    ("arcene", 1),                   # 200 rows x 10,001 columns - wide and tiny
+    ("madelon", 1),                  # 500 columns, deliberately hard
+
+    # Round 4. Hunting a genuine date column: `electricity` turned out to be
+    # normalised to floats, so temporal-column has still never seen a real
+    # one. Time-based leakage is the kind practitioners hit most often.
+    ("Bike_Sharing_Demand", 2),
+    ("nyc-taxi-green-dec-2016", 2),
+    ("rainfall_bangladesh", 1),
+    ("Rain_in_Australia", 1),
+    ("avocado_sales", 1),
+    ("seattlecrime6", 2),
+    ("diamonds", 1),
+    ("Airlines", 1),
+    ("KDD98", 1),
+    ("okcupid-stem", 1),
+
+    # Round 7. Extreme imbalance is the real target here: at a 0.17% base rate
+    # the null SE and the base-rate gate on subset purity get stressed harder
+    # than anything swept so far. Plus the 100-class ceiling boundary and a
+    # 4,297-column frame.
+    ("creditcard", 1),               # 284,807 x 31, ~0.17% positive
+    ("APSFailure", 1),               # 76k x 171, imbalanced AND heavy missing
+    ("one-hundred-plants-margin", 1),  # exactly 100 classes - the ceiling
+    ("shuttle", 1),                  # imbalanced 7-class
+    ("connect-4", 1),                # 67k x 43, 3 classes
+    ("volkert", 1),                  # 58k x 181, 10 classes
+    ("riccardo", 1),                 # 20k x 4,297 - very wide
+    ("christine", 1),                # 1,636 x 1,637 - wide with few rows
+    ("jasmine", 1),                  # 2,984 x 145
+    ("click_prediction_small", 1),   # imbalanced click-through
 ]
 
 
