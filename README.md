@@ -12,6 +12,34 @@ targetleak --demo
 
 > For `.parquet` files: `pip install "targetleak[parquet]"`
 
+## Status: early, and here is exactly how early
+
+**0.1.x. Days old. Run against one production dataset besides its own test
+suite.** Read the findings and apply your own judgement; that is a safe and
+useful way to use it today. What I would not do yet is wire it into a shared
+CI pipeline as a blocking gate before you have run it by hand a few times and
+built up the `--ignore` list, because a false positive that blocks a
+colleague's pull request on day one is how a check gets deleted.
+
+Three things worth knowing before you rely on it:
+
+- **Every real dataset it has met exposed a bug the synthetic tests missed** -
+  pandas 3 string dtypes, NaN targets being read as the negative class, an
+  integer-cardinality cliff, and a leak that only covered 121 rows. Four for
+  four. There is no reason to think the fifth real dataset will not make it
+  five, and yours might be the one.
+- **Roughly 4% of clean columns get flagged** (5 of 121 in the benchmark
+  below). Expect some noise and expect to suppress a few columns.
+- **A clean report is not proof of absence.** It cannot tell a leak from a
+  genuinely easy problem - see the benchmark, where that limitation is
+  measured rather than hidden.
+
+The most useful thing you can send is a dataset shape that crashes it or
+produces an obviously wrong finding.
+[Open an issue](https://github.com/ShriyansBharuka/TargetLeak/issues) - you do
+not need to share the data, just the column types, the rough shape, and what
+it said.
+
 ```
 CRITICAL target-proxy [cancellation_reason]
          alone separates the target at 1.0000 (true AUC 1.0000), 29.9 SE
