@@ -23,11 +23,13 @@ colleague's pull request on day one is how a check gets deleted.
 
 Three things worth knowing before you rely on it:
 
-- **Every real dataset it has met exposed a bug the synthetic tests missed** -
-  pandas 3 string dtypes, NaN targets being read as the negative class, an
-  integer-cardinality cliff, and a leak that only covered 121 rows. Four for
-  four. There is no reason to think the fifth real dataset will not make it
-  five, and yours might be the one.
+- **The first four real datasets it met each exposed a bug the synthetic tests
+  missed** - pandas 3 string dtypes, NaN targets being read as the negative
+  class, an integer-cardinality cliff, and a leak covering only 121 rows. A
+  later sweep across ten more real datasets found no crashes and no
+  false-positive clusters, which is why those ten are now in the benchmark.
+  That is reassuring rather than conclusive: fourteen datasets is not many,
+  and yours may still be the one that breaks it.
 - **Roughly 4% of clean columns get flagged** (5 of 121 in the benchmark
   below). Expect some noise and expect to suppress a few columns.
 - **A clean report is not proof of absence.** It cannot tell a leak from a
@@ -178,14 +180,32 @@ python benchmark/run_benchmark.py
 | dataset | rows | cols | known leaks | found | false positives |
 |---|---:|---:|---|---|---:|
 | titanic | 1,309 | 13 | `boat`, `body` | `boat`, `body` | 0 |
+| credit-g | 1,000 | 20 | - | - | 0 |
+| adult | 48,842 | 14 | - | - | 0 |
+| kc1 | 2,109 | 21 | - | - | 0 |
+| bank-marketing | 45,211 | 16 | - | - | 0 |
+| Australian | 690 | 14 | - | - | 0 |
+| dresses-sales | 500 | 12 | - | - | 0 |
+| SpeedDating | 8,378 | 120 | - | - | 2 |
+| churn | 5,000 | 20 | - | - | 0 |
 | iris | 150 | 4 | - | - | 2 |
 | wine | 178 | 13 | - | - | 3 |
 | breast_cancer | 569 | 30 | - | - | 0 |
 | digits | 1,797 | 64 | - | - | 0 |
 | diabetes | 442 | 10 | - | - | 0 |
 
-**Recall on documented leaks: 2/2. False positives on clean data: 5 across 121
-columns in 5 datasets.**
+**Recall on documented leaks: 2/2. False positives on clean data: 7 across 358
+columns in 13 datasets (2.0%).**
+
+Eight of those are ordinary supervised-learning sets in wide use with no
+leakage anyone has reported, and unlike iris and wine they carry the mess of
+real data: pandas `category` columns, heavy missingness, a 121-column frame,
+imbalanced targets. Zero false positives across them is the number that
+matters most here.
+
+The two on SpeedDating are the name rule misfiring: with the target called
+`match`, `expected_num_matches` looks like a sibling of it, when it is really
+a survey answer collected *before* the event. Counted, not tuned away.
 
 Titanic's `boat` and `body` are the textbook leakage example — a lifeboat
 number exists only for people who got into a lifeboat, a body-recovery number
@@ -206,6 +226,31 @@ That column identifies only 121 of 1,309 passengers, so its missingness AUC is
 those 121 died. A column can give the answer away on a subset of rows while
 looking like noise overall, and that check now exists because a dataset we did
 not write exposed its absence.
+
+## A real find in a dataset nobody warned us about
+
+Pointed at UCI's `cylinder-bands` (540 rows, printing-press defects), it
+reported seven critical findings, which looked at first like a false-positive
+cluster. It was not:
+
+| column | rows missing | target on those rows | that class overall | P under the null |
+|---|---:|---|---:|---:|
+| `solvent_type` | 55 | **all** `band` | 42.2% | 2.5e-21 |
+| `varnish_pct` | 56 | **all** `band` | 42.2% | 1.1e-21 |
+| `ink_pct` | 56 | **all** `band` | 42.2% | 1.1e-21 |
+| `ESA_Amperage` | 55 | **all** `band` | 42.2% | 2.5e-21 |
+
+Seven process measurements share the same ~55 missing rows, and every one of
+those rows is a defective band, in a dataset where defects are 42% of the
+total. The plain reading is that when a defect occurred the run was abandoned
+and the measurements were never taken, so the *absence* of a reading carries
+the outcome. Train on this with a random split and impute the gaps and you
+will get a model that looks good and knows nothing.
+
+Whether that is a leak or a legitimate signal depends on when those
+measurements are recorded relative to the defect being known - which a domain
+expert can answer and this tool cannot. That is the honest shape of every
+finding here: it points, you decide.
 
 ## A real find
 

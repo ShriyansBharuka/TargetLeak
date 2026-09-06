@@ -80,6 +80,36 @@ def build_cases(with_network=True):
         except Exception as e:  # offline: say so rather than silently skip
             print(f"  (skipping titanic: {type(e).__name__})", file=sys.stderr)
 
+    # Real datasets, fetched not constructed. Eight of them are ordinary
+    # supervised-learning sets in wide use with no leakage anyone has
+    # reported, so a critical finding on any of them counts against us -
+    # and unlike iris and wine they carry the messiness of real data:
+    # pandas `category` dtype, heavy missingness, 121-column frames,
+    # imbalanced targets. This is the negative set that actually matters.
+    real = [
+        ("credit-g", 1, "categorical-heavy, 1k rows"),
+        ("adult", 2, "48k rows, mixed dtypes"),
+        ("kc1", 1, "software metrics, all float"),
+        ("bank-marketing", 1, "45k rows, 10 category columns"),
+        ("Australian", 4, "small and categorical"),
+        ("dresses-sales", 1, "500 rows, 12 category columns, missingness"),
+        ("SpeedDating", 1, "121 columns"),
+        ("churn", 1, "imbalanced binary target"),
+    ]
+    if with_network:
+        for name, ver, note in real:
+            c = Case(name, None, note=note, needs_net=True)
+            try:
+                from sklearn.datasets import fetch_openml
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    b = fetch_openml(name, version=ver, as_frame=True,
+                                     parser="pandas")
+                c.frame, c.target = b.frame, b.target.name
+                cases.append(c)
+            except Exception as e:
+                print(f"  (skipping {name}: {type(e).__name__})", file=sys.stderr)
+
     clean = [
         ("iris", "load_iris", "genuinely easy: one feature nearly splits a class"),
         ("wine", "load_wine", "genuinely easy, 13 features, 3 classes"),

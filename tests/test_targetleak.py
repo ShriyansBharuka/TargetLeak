@@ -999,3 +999,66 @@ def test_noise_categoricals_produce_nothing_end_to_end():
                 and f.kind in ("target-proxy", "suspiciously-predictive",
                                "pure-categories")]
         assert not loud, f"n={n}: {loud}"
+
+
+# --- pandas extension dtypes: ubiquitous in real data, previously untested ---
+
+@pytest.mark.parametrize("dtype", ["category", "string", "Int64", "Float64",
+                                   "boolean"])
+def test_extension_dtypes_are_scored_not_skipped(dtype):
+    """Every real dataset pulled from OpenML arrives with `category` columns,
+    and read_parquet / convert_dtypes produce the nullable Int64 / Float64 /
+    boolean / string types routinely. None of them had any coverage, which is
+    the same blind spot that let the pandas-3 str-vs-object bug ship."""
+    rng = np.random.default_rng(0)
+    n = 2000
+    y = rng.integers(0, 2, n)
+    # A leak expressed in the dtype under test.
+    if dtype in ("category", "string"):
+        leak = pd.Series(np.where(y == 1, "yes", "no")).astype(dtype)
+    elif dtype == "boolean":
+        leak = pd.Series(y.astype(bool)).astype("boolean")
+    else:
+        leak = pd.Series(y * 50.0).astype(dtype)
+    df = pd.DataFrame({"leak": leak, "noise": rng.normal(size=n), "y": y})
+    out = tl.analyse(df, "y")
+    crit = {f.column for f in out if f.severity == "critical"}
+    assert "leak" in crit, f"{dtype} leak missed: {[(f.kind, f.column) for f in out]}"
+    assert "noise" not in crit
+
+
+@pytest.mark.parametrize("dtype", ["category", "string", "Int64", "boolean"])
+def test_extension_dtypes_as_the_target(dtype):
+    rng = np.random.default_rng(1)
+    n = 1500
+    y = rng.integers(0, 2, n)
+    if dtype in ("category", "string"):
+        target = pd.Series(np.where(y == 1, "churned", "stayed")).astype(dtype)
+    elif dtype == "boolean":
+        target = pd.Series(y.astype(bool)).astype("boolean")
+    else:
+        target = pd.Series(y).astype(dtype)
+    df = pd.DataFrame({"leak": y * 40.0 + rng.normal(0, .3, n),
+                       "noise": rng.normal(size=n), "t": target})
+    crit = {f.column for f in tl.analyse(df, "t") if f.severity == "critical"}
+    assert crit == {"leak"}, crit
+
+
+def test_pd_na_in_a_nullable_target_is_not_the_negative_class():
+    """The NaN-as-negative bug in its nullable-dtype form: pd.NA rather than
+    np.nan, which compares differently."""
+    rng = np.random.default_rng(2)
+    n = 3000
+    t = pd.array([pd.NA] * n, dtype="Int64")
+    t[:600] = pd.array(rng.integers(0, 2, 600), dtype="Int64")
+    df = pd.DataFrame({
+        "cohort": np.where(np.arange(n) < 600, "labelled", "unlabelled"),
+        "junk": rng.normal(size=n),
+        "t": t,
+    })
+    out = tl.analyse(df, "t")
+    leaky = {f.column for f in out
+             if f.kind in ("target-proxy", "suspiciously-predictive",
+                           "pure-categories", "missingness-leak")}
+    assert "cohort" not in leaky, leaky
+    assert any(f.kind == "target-mostly-null" for f in out)
