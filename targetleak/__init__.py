@@ -87,12 +87,11 @@ PERMUTATIONS = 60
 # a couple of seconds - the cost was per candidate, and wide frames have many.
 CALIBRATE_BELOW = 3.0
 # The dataset is easy rather than leaky above this share of columns being
-# individually predictive - AND this many of them in absolute terms. The share
-# alone misfires on narrow frames: two leaks among six columns is 33% and is
-# the perfectly ordinary case this note must not reframe. The note exists to
-# defuse a wall of a hundred findings, and two is not a wall.
+# individually predictive AND with no critical among them. The share alone
+# misfires on narrow frames: two leaks among six columns is 33%, and that is
+# the ordinary case this note must not reframe - but those two read critical,
+# which is the condition that suppresses it. See `leak_candidate` in analyse().
 WIDESPREAD_SHARE = 0.25
-WIDESPREAD_MIN = 8
 
 
 # Finding a leak is half the job. Naming the leak without saying what to do
@@ -1059,11 +1058,23 @@ def analyse(df, target, split=None, group=None, ignore=()):
         except Exception:
             pass
 
+    _sep_kinds = ("target-proxy", "suspiciously-predictive", "pure-categories")
     separable = {f.column for f in findings
                  if f.column and f.severity in ("critical", "warning")
-                 and f.kind in ("target-proxy", "suspiciously-predictive",
-                                "pure-categories")}
-    if (len(separable) >= WIDESPREAD_MIN and scored_features
+                 and f.kind in _sep_kinds}
+    # A leak is a copy of the answer, so it lands at or beside a perfect score
+    # and reads critical. If even one column is there, this is not an easy
+    # problem being misread - it is a leak candidate, and reframing the report
+    # around "the dataset is working" would bury it.
+    #
+    # This deliberately replaces a `>= WIDESPREAD_MIN` floor on the flagged
+    # count. That floor was unreachable on the frames with the highest flagged
+    # share: breast-w, glass, ecoli, yeast and shuttle all have nine features,
+    # so a note explaining seven flags among nine could never fire on exactly
+    # the datasets that most needed it.
+    leak_candidate = any(f.column in separable and f.severity == "critical"
+                         for f in findings if f.kind in _sep_kinds)
+    if (separable and not leak_candidate and scored_features
             and len(separable) / len(scored_features) >= WIDESPREAD_SHARE):
         share = len(separable) / len(scored_features)
         findings.append(Finding(

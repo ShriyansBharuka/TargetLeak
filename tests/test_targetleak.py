@@ -1133,24 +1133,72 @@ def test_calibration_runs_near_the_bar_and_is_skipped_far_from_it():
 def test_widespread_separability_reframes_a_wall_of_findings():
     """On a 216-feature digit-recognition set, 99 columns are each individually
     predictive - correct per column, useless as a report. That pattern means an
-    easy problem, not a hundred leaks, and the report has to say so."""
+    easy problem, not a hundred leaks, and the report has to say so.
+
+    The noise here is calibrated on measured reality: on breast-w, glass and
+    yeast the flagged columns score 0.90-0.97, never 1.0. Strong-but-imperfect
+    is what a genuinely easy problem looks like. An earlier version of this
+    fixture used y * 8.0 + noise(0.4), which puts twenty columns at AUC 1.0000
+    - that is twenty leaks, not an easy problem, and it is the case the note
+    must now stay quiet on.
+    """
     rng = np.random.default_rng(7)
     n = 1200
     y = rng.integers(0, 2, n)
-    # Twenty features that all genuinely separate the target.
-    data = {f"f{i}": y * 8.0 + rng.normal(0, 0.4, n) for i in range(20)}
+    data = {f"f{i}": y * 2.1 + rng.normal(0, 1.0, n) for i in range(20)}
     data["y"] = y
     out = tl.analyse(pd.DataFrame(data), "y")
+    assert not [f for f in out if f.severity == "critical"], \
+        "setup: strong but imperfect, so nothing should read as a leak"
     note = [f for f in out if f.kind == "widespread-separability"]
     assert note, [f.kind for f in out]
     assert note[0].column is None, "it is a dataset-level statement"
     assert "%" in note[0].detail and note[0].fix
 
 
+def test_widespread_note_fires_on_a_frame_too_narrow_to_reach_a_count_floor():
+    """breast-w, glass, ecoli, yeast and shuttle each have nine features and
+    seven or so flagged. The old absolute floor of eight flagged columns could
+    never be met there, so the note that explains a busy report was unreachable
+    on exactly the datasets with the highest flagged share."""
+    rng = np.random.default_rng(11)
+    n = 900
+    y = rng.integers(0, 2, n)
+    # Six of nine predictive, as on breast-w. Fewer than the old floor of
+    # eight, but two thirds of the frame.
+    data = {f"f{i}": y * 2.1 + rng.normal(0, 1.0, n) for i in range(6)}
+    data.update({f"n{i}": rng.normal(0, 1.0, n) for i in range(3)})
+    data["y"] = y
+    out = tl.analyse(pd.DataFrame(data), "y")
+    flagged = {f.column for f in out if f.column and f.kind in
+               ("target-proxy", "suspiciously-predictive", "pure-categories")}
+    assert 3 <= len(flagged) < 8, \
+        f"setup: below the old floor of eight, got {flagged}"
+    assert [f for f in out if f.kind == "widespread-separability"], \
+        [f.kind for f in out]
+
+
 def test_no_widespread_note_for_a_single_leak(demo):
     """One or two leaky columns is the normal case and must not be reframed."""
     assert not [f for f in tl.analyse(demo, "churned")
                 if f.kind == "widespread-separability"]
+
+
+def test_one_critical_among_many_warnings_is_not_reframed_as_an_easy_problem():
+    """The suppression rule is what stops the note burying a leak. Nine
+    predictive columns and one exact copy of the target: the share clears
+    WIDESPREAD_SHARE, but a critical is present, so the report must not tell
+    the reader the dataset is merely working."""
+    rng = np.random.default_rng(13)
+    n = 900
+    y = rng.integers(0, 2, n)
+    data = {f"f{i}": y * 2.1 + rng.normal(0, 1.0, n) for i in range(9)}
+    data["leaked"] = y.astype(float)
+    data["y"] = y
+    out = tl.analyse(pd.DataFrame(data), "y")
+    assert any(f.severity == "critical" and f.column == "leaked" for f in out)
+    assert not [f for f in out if f.kind == "widespread-separability"], \
+        "a leak candidate is present; reframing would bury it"
 
 
 def test_indicator_encoding_matches_the_groupby_path():

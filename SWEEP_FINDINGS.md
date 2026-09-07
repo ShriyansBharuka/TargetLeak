@@ -10,7 +10,8 @@ the regression cases each entry specifies.
 | | finding | state |
 |---|---|---|
 | F1 | 26-class targets refused outright | **fixed** |
-| F2 | many-class datasets reported walls of critical findings (7 instances) | **fixed** |
+| F2a | many-class datasets reported walls of critical findings (7 instances) | **fixed** |
+| F2b | ...and the note explaining a busy report could not fire on narrow frames | **fixed** |
 | F3 | `audiology` refused by 0.6 of a row | **fixed** |
 | F4 | numeric percentage read as 56 unordered classes | **fixed** |
 | F5 | KDD98 183s — explained; the obvious optimisation is unsafe | won't fix, documented |
@@ -48,16 +49,48 @@ per-column rule can see redundancy against other features**, and the threshold
 was deliberately not tuned to hide it — that is the mistake the F2 fix has
 already made three times.
 
-**F2 turned out not to be about the widespread note at all.** Three revisions
-of that note were each broken by a dataset the previous one had not seen; the
-fourth attempt found the real cause. One-vs-rest keeps the best of K classes,
-so "near-perfect for species 47 of 100" was reported with the same weight as
-"this column is the answer". Severity now follows the macro-averaged score:
-a copy of a 10-class label scores 1.0000 by max and by macro, while a
-leaf-margin feature scores 0.9870 by max and 0.6823 by macro. Plants went from
-32 criticals to 0, mfeat from 4 to 0, shuttle from 5 to 0, and the benchmark's
-false positives from 7 to 2 - iris and wine to zero, which no threshold tuning
-was going to achieve honestly.
+**F2 was two problems wearing one name, and the first fix only closed one.**
+
+The severity half: one-vs-rest keeps the best of K classes, so "near-perfect
+for species 47 of 100" was reported with the same weight as "this column is
+the answer". Severity now follows the macro-averaged score - a copy of a
+10-class label scores 1.0000 by max and by macro, while a leaf-margin feature
+scores 0.9870 by max and 0.6823 by macro. Plants went from 32 criticals to 0,
+mfeat from 4 to 0, shuttle from 5 to 0, and the benchmark's false positives
+from 7 to 2, iris and wine to zero.
+
+The reframing half stayed open, and **the weekly sweep caught that I had
+called it closed.** The run on 2026-09-07, after the severity fix, still
+reported seven datasets as "noisy, unexplained" - because that measure counts
+warnings, and the fix moved findings from critical to warning without reducing
+how many columns the report names. An engineer opening `shuttle` still saw
+eight flags on nine columns and no explanation. `WIDESPREAD_MIN = 8` required
+eight flagged columns in absolute terms, and breast-w, glass, ecoli, yeast and
+shuttle all have nine features or fewer, so the note that exists to explain a
+busy report could never fire on the frames with the highest flagged share.
+
+That floor is now gone, replaced by the condition it was standing in for: fire
+the note when the flagged share is high **and no flagged column reads
+critical**. A leak is a copy of the answer, so it lands beside a perfect score
+and reads critical; if one is present the report must not tell the reader the
+dataset is merely working. Measured after the change:
+
+| dataset | features | flagged | before | after |
+|---|---:|---:|---|---|
+| breast-w | 9 | 8 | unexplained | explained |
+| shuttle | 9 | 8 | unexplained | explained |
+| glass | 9 | 7 | unexplained | explained |
+| ecoli | 7 | 4 | unexplained | explained |
+| yeast | 8 | 5 | unexplained | explained |
+| letter | 16 | 7 | unexplained | explained |
+| mfeat-factors | 216 | 101 | explained | explained |
+| diamonds | 9 | 5 | unexplained | **still unexplained** |
+| demo frame (2 planted leaks of 6) | 6 | 2 | quiet | quiet |
+
+`diamonds` keeps its silence correctly: three of its columns read critical, so
+the suppression rule holds the note back rather than burying them. Whether
+`carat` predicting `price` at that strength is a leak or the physics of the
+dataset is exactly the judgement the tool defers to the reader.
 
 One trade, made deliberately: a *noisy numeric copy* of a nominal label is now
 a warning rather than a critical, because ranks cannot separate a middle class
