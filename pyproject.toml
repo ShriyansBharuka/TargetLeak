@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "targetleak"
-version = "0.1.1"
+version = "0.2.0"
 description = "Find data leakage in a training set before it fools you."
 readme = "README.md"
 authors = [{ name = "Shriyans Bharuka" }]

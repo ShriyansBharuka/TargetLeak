@@ -14,24 +14,24 @@ targetleak --demo
 
 ## Status: early, and here is exactly how early
 
-**0.1.x. Days old. Run against one production dataset besides its own test
-suite.** Read the findings and apply your own judgement; that is a safe and
-useful way to use it today. What I would not do yet is wire it into a shared
-CI pipeline as a blocking gate before you have run it by hand a few times and
-built up the `--ignore` list, because a false positive that blocks a
-colleague's pull request on day one is how a check gets deleted.
+**0.2.0. Weeks old. Swept across ~100 real public datasets and run against one
+production dataset besides its own test suite.** Read the findings and apply
+your own judgement; that is a safe and useful way to use it today. What I would
+not do yet is wire it into a shared CI pipeline as a blocking gate before you
+have run it by hand a few times and built up the `--ignore` list, because a
+false positive that blocks a colleague's pull request on day one is how a check
+gets deleted.
 
 Three things worth knowing before you rely on it:
 
 - **The first four real datasets it met each exposed a bug the synthetic tests
   missed** - pandas 3 string dtypes, NaN targets being read as the negative
   class, an integer-cardinality cliff, and a leak covering only 121 rows. A
-  later sweep across ten more real datasets found no crashes and no
-  false-positive clusters, which is why those ten are now in the benchmark.
-  That is reassuring rather than conclusive: fourteen datasets is not many,
-  and yours may still be the one that breaks it.
-- **Roughly 4% of clean columns get flagged** (5 of 121 in the benchmark
-  below). Expect some noise and expect to suppress a few columns.
+  later sweep across ~100 more found eleven further problems, all of them
+  fixed or documented in [`SWEEP_FINDINGS.md`](SWEEP_FINDINGS.md). Yours may
+  still be the one that breaks it, but it is no longer the first hard one.
+- **Roughly 0.6% of clean columns get flagged** (2 of 358 in the benchmark
+  below). Expect a little noise and expect to suppress the odd column.
 - **A clean report is not proof of absence.** It cannot tell a leak from a
   genuinely easy problem - see the benchmark, where that limitation is
   measured rather than hidden.
