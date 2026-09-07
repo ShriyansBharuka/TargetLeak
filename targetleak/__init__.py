@@ -92,6 +92,16 @@ CALIBRATE_BELOW = 3.0
 # the ordinary case this note must not reframe - but those two read critical,
 # which is the condition that suppresses it. See `leak_candidate` in analyse().
 WIDESPREAD_SHARE = 0.25
+# A pure group must also COVER something. Improbability alone is not enough:
+# riccardo's 4,296 quantised features repeat each non-zero value about 37
+# times, and 37 rows all landing on a 25% class is p = 5e-23 - real, and
+# nothing to do with leakage. It is the tail bucket of a continuous
+# distribution, whose actual relationship to the target the AUC path already
+# measures. Requiring the largest pure group to cover 5% of rows separates
+# that (0.185%) from the leak shape this check is for: a reason code covering
+# 46% of credit-g, or Titanic's `body` at 9%. The cost is a genuine leak
+# confined to a very small slice, which stays invisible here.
+PURE_MIN_SHARE = 0.05
 
 
 # Finding a leak is half the job. Naming the leak without saying what to do
@@ -103,10 +113,12 @@ FIXES = {
         "Drop it, or rebuild it from data available strictly before the "
         "prediction cutoff.",
     "pure-categories":
-        "The categories partition the target, which usually means the column "
-        "was derived from the outcome - a reason code only filled in for one "
-        "class, for example. Drop it, or collapse it to categories that exist "
-        "before the outcome does.",
+        "Specific values of this column partition the target, which usually "
+        "means it was derived from the outcome - a reason code only filled in "
+        "for one class, or a sentinel amount written once the result was "
+        "known. Find out when those values are set. If it is at or after the "
+        "moment the target becomes known, drop the column or rebuild it from "
+        "values that exist before the outcome does.",
     "suspicious-name":
         "If it is a label, drop it from the feature matrix. If it genuinely is "
         "a feature, rename it: the current name will mislead every future "
@@ -1253,7 +1265,20 @@ def _column_findings(c, col, y, kind, n_features=1, varied_in_file=False):
             "confirm it exists at prediction time.",
             scored(_evidence(col, y, binary))))
 
-    if not pd.api.types.is_numeric_dtype(col) or _looks_categorical(col):
+    # Not "is this a categorical column" but "can any repeated value carry the
+    # answer" - which is a question about the values, not the dtype. A numeric
+    # column with a pure sub-population is the same leak as a pure category:
+    # a refund amount that is exactly 0.00 on 400 rows, every one of them a
+    # non-churner, gives the answer away on those rows however continuous the
+    # rest of the column looks. Only the categorical half used to be checked.
+    #
+    # The gate is arithmetic on numbers already computed. The most frequent
+    # value can occur at most `len - n_unique + 1` times, so below the support
+    # floor no value can qualify and there is nothing to group. That is what
+    # keeps this off genuinely continuous columns, where every value is unique
+    # and the grouping would be pure cost.
+    could_repeat = (len(col) - int(n_unique) + 1) >= MIN_CATEGORY_SUPPORT
+    if could_repeat:
         purity, pure_n, pure_val = _category_purity(col, y)
         # This used to require `score >= AUC_WARN`, which gated the check
         # behind the very dilution it exists to see past. A reason code filled
@@ -1271,17 +1296,22 @@ def _column_findings(c, col, y, kind, n_features=1, varied_in_file=False):
         if pure_n:
             rate = float((pd.Series(np.asarray(y)) == pure_val).mean())
             p_null = rate ** pure_n
-        if pure_n and p_null * max(n_features, 1) <= 0.01:
-            # The share decides how loud, the p-value decides whether to speak
-            # at all. Categories covering most of the frame ARE the target;
-            # one pure category among several mixed ones is a leak on a subset,
-            # which is worth confirming rather than asserting.
+        covers = pure_n / len(col) if len(col) else 0.0
+        if (pure_n and covers >= PURE_MIN_SHARE
+                and p_null * max(n_features, 1) <= 0.01):
+            # Two gates, two different jobs: the p-value says this is not
+            # chance, PURE_MIN_SHARE says it is not a rounding artefact. Then
+            # the aggregate share decides how loud - values partitioning most
+            # of the frame ARE the target, while one pure group among mixed
+            # ones is a leak on a subset, worth confirming rather than
+            # asserting.
             findings.append(Finding(
                 "critical" if purity >= 0.5 else "warning", "pure-categories", c,
-                f"{purity:.0%} of rows fall in categories with exactly one "
-                f"target value - the largest covers {pure_n:,} rows that are "
-                f"all {_plain(pure_val)!r}, a class making up {rate:.1%} of "
-                "the data. The category encodes the answer.",
+                f"{purity:.0%} of rows sit in groups of one repeated value "
+                f"that carry exactly one target value - the largest covers "
+                f"{pure_n:,} rows, all {_plain(pure_val)!r}, a class making up "
+                f"{rate:.1%} of the data. The value gives the answer away on "
+                "the rows it covers.",
                 _evidence_pure(col.astype("object"), y)))
 
     return findings

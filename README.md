@@ -128,7 +128,7 @@ data never leaves your runner; only the findings reach the comment.
 | Check | Catches |
 |---|---|
 | `target-proxy` | One column that nearly solves the target on its own |
-| `pure-categories` | Categories that partition the target exactly |
+| `pure-categories` | A repeated value whose rows all carry one target class |
 | `suspicious-name` | Columns *named* like labels or forward-looking values |
 | `identifier-like` | IDs the model will memorise instead of learning |
 | `suspiciously-predictive` | Strong enough to be worth confirming |
@@ -211,21 +211,28 @@ python benchmark/recall.py
 
 | planted leak | full strength | covering 70% | 40% | 20% |
 |---|---|---|---|---|
-| target proxy computed from the answer | 6/6 | 6/6 | 0/6 | 0/6 |
+| target proxy computed from the answer | 6/6 | 6/6 | 6/6 | 6/6 |
 | reason code filled in for one class | 6/6 | 6/6 | 6/6 | 6/6 |
 | measurement never taken when it happened | 6/6 | 6/6 | 6/6 | 6/6 |
 | the answer plus noise | 6/6 | 6/6 | 6/6 | 3/6 |
 
-**81 of 96 planted leaks found (84%) across six real datasets.** Reported per
-family and per strength on purpose, because one recall percentage hides a whole
-family being invisible — which is exactly what this found on its first run. The
-`reason code` row was 0/6 at every strength below full, in all six datasets:
-the check meant to catch it was gated behind the AUC threshold whose dilution
-it existed to see past. That row is the fix.
+**93 of 96 planted leaks found (97%) across six real datasets**, with the three
+misses all in the weakest row — a column separating the target at about 0.72,
+which is genuinely near the edge of what one column can show.
 
-The remaining hole is honest and open: a numeric column with pure
-sub-populations is the same leak as a pure category, and only the categorical
-version is checked.
+Reported per family and per strength on purpose, because one recall percentage
+hides a whole family being invisible — which is exactly what this found on its
+first run, twice. `reason code` was 0/6 below full strength in all six
+datasets, because the check meant to catch it was gated behind the AUC
+threshold whose dilution it existed to see past. Then `target proxy` was 0/6
+below 70%, because a numeric column with pure sub-populations is the same leak
+as a pure category and only the categorical half was ever checked.
+
+Both gates now come from the data rather than the dtype: a group of identical
+values must be improbable under the base rate **and** cover at least 5% of the
+rows. The coverage floor is not decoration — without it the check fires on
+4,283 of riccardo's 4,296 quantised features, where 37 rows sharing a float
+value land on one class at p = 5e-23 and mean nothing at all.
 
 Eight of those are ordinary supervised-learning sets in wide use with no
 leakage anyone has reported, and unlike iris and wine they carry the mess of

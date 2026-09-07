@@ -719,7 +719,10 @@ def test_every_visible_kind_has_a_remedy(demo):
 def test_report_wraps_and_deduplicates_fixes(demo):
     text = tl.report(tl.analyse(demo, "churned"))
     assert "FIX:" in text
-    assert text.count("FIX: The categories partition") == 1, "fix repeated per column"
+    # Taken from FIXES rather than typed out, so rewording the remedy does not
+    # look like the deduplication breaking.
+    opener = " ".join(tl.FIXES["pure-categories"].split()[:4])
+    assert text.count(f"FIX: {opener}") == 1, "fix repeated per column"
     assert all(len(ln) <= 90 for ln in text.splitlines()), "unwrapped text"
     assert "FIX:" not in tl.report(tl.analyse(demo, "churned"), show_fixes=False)
 
@@ -797,6 +800,47 @@ def test_a_small_pure_category_of_noise_does_not_fire():
     df["y"] = y
     assert not [f for f in tl.analyse(df, "y") if f.kind == "pure-categories"], \
         "noise must not produce a leak finding"
+
+
+def test_a_numeric_column_with_pure_sub_populations_is_found():
+    """A refund amount that is exactly 0.00 on the rows that did not churn is
+    the pure-category leak in numeric clothing. The check used to run only on
+    categoricals, so a planted proxy covering 40% of rows was missed in all six
+    datasets of benchmark/recall.py while the identical leak stored as text was
+    caught."""
+    rng = np.random.default_rng(6)
+    n = 1200
+    y = rng.integers(0, 2, n)
+    covered = rng.random(n) < 0.45
+    amount = np.where(covered, y * 100.0, rng.normal(50, 30, n))
+    df = pd.DataFrame({"refund_amount": amount, "tenure": rng.normal(size=n),
+                       "region": rng.choice(list("abcd"), n), "y": y})
+    out = tl.analyse(df, "y")
+    assert [f for f in out if f.kind == "pure-categories"
+            and f.column == "refund_amount"], [(f.kind, f.column) for f in out]
+
+
+def test_a_quantised_continuous_column_does_not_fire():
+    """Improbability is not enough; a pure group has to cover something.
+
+    Measured on riccardo (20,000 x 4,296), whose quantised features repeat each
+    non-zero value about 37 times. Thirty-seven rows all landing on a 25% class
+    is p = 5e-23 - real, and nothing to do with leakage: it is the tail bucket
+    of a continuous distribution. Without a coverage floor this fired on 4,283
+    of 4,296 columns.
+    """
+    rng = np.random.default_rng(9)
+    n = 6000
+    y = rng.integers(0, 2, n)
+    # Quantised noise: ~150 distinct values, so each repeats ~40 times, and
+    # some of those small groups will be pure by chance alone.
+    col = np.round(rng.normal(0, 1, n), 2) * (rng.random(n) > 0.4)
+    df = pd.DataFrame({f"v{i}": np.round(rng.normal(0, 1, n), 2)
+                       for i in range(8)})
+    df["v0"] = col
+    df["y"] = y
+    pure = [f for f in tl.analyse(df, "y") if f.kind == "pure-categories"]
+    assert not pure, [(f.column, f.detail[:90]) for f in pure]
 
 
 def test_purity_share_sets_the_volume_not_the_gate():

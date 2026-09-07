@@ -9,6 +9,7 @@ the regression cases each entry specifies.
 
 | | finding | state |
 |---|---|---|
+| F0 | `pure-categories` could not fire on the shape it was written for | **fixed** |
 | F1 | 26-class targets refused outright | **fixed** |
 | F2a | many-class datasets reported walls of critical findings (7 instances) | **fixed** |
 | F2b | ...and the note explaining a busy report could not fire on narrow frames | **fixed** |
@@ -21,6 +22,43 @@ the regression cases each entry specifies.
 | F9 | normalised floats read as discrete flags | **fixed** |
 | F10 | findings changed with the file format | **fixed** |
 | F11 | tank numbers read as years | **fixed** |
+
+**F0 came from a different instrument.** The sweep looks for crashes, runtime
+and noise, so it is blind to a miss by construction - nobody has annotated
+these files. `benchmark/recall.py` closes that by planting leaks in real data,
+and its first run found an entire family invisible: a reason code filled in
+only for one outcome, missed at every strength below full, in all six
+datasets. On credit-g the planted column had 460 rows at 100% positive under a
+70% base rate and produced no finding whatsoever.
+
+`pure-categories` required `score >= AUC_WARN`, which gated the check behind
+the very dilution it existed to see past: the pure part gives the answer away,
+the mixed catch-all default drags the column to 0.83, and the check never ran.
+It could only fire on columns the AUC path was already flagging.
+
+Fixing that exposed the same hole in numeric clothing - a column that is
+exactly 0.00 on the rows that did not churn is the identical leak, and only the
+categorical branch was checked. Both now run on any column where a value can
+repeat enough to matter, gated on improbability under the base rate **and**
+coverage of at least 5% of rows.
+
+The coverage floor is load-bearing, and one dataset proves it. Without it the
+check fires on **4,283 of riccardo's 4,296 columns**: its quantised features
+repeat each non-zero value about 37 times, and 37 rows all landing on a 25%
+class is p = 5e-23. Real, and nothing to do with leakage - it is the tail
+bucket of a continuous distribution, whose relationship to the target the AUC
+path already measures properly. Improbability alone was never the right test.
+
+| | before | after |
+|---|---:|---:|
+| planted-leak recall | 66% | **97%** |
+| riccardo `pure-categories` findings | 4,283 | **0** |
+| mushroom flagged share | 55% (unexplained) | **23%** |
+| benchmark false positives | 2 / 358 | 2 / 358 |
+| documented-leak recall | 2/2 | 2/2 |
+
+The cost is stated rather than hidden: a genuine leak confined to under 5% of
+rows is invisible to this check. Titanic's `body` covers 9% and survives.
 
 **F3, F4, F9, F10 and F11 were one root cause** — a decision about a column
 made from how it is *stored* rather than what it *contains* — and one change
