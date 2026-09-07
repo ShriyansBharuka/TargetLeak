@@ -199,6 +199,34 @@ python benchmark/run_benchmark.py
 **Recall on documented leaks: 2/2. False positives on clean data: 2 across 358
 columns in 13 datasets (0.6%).**
 
+Two documented leaks is too few to say anything about which *kinds* of leak get
+caught, and publicly documented tabular leaks with downloadable data are
+scarce. So there is a second benchmark that plants them instead — the data
+stays real, only the leak is injected, which gives ground truth by
+construction:
+
+```bash
+python benchmark/recall.py
+```
+
+| planted leak | full strength | covering 70% | 40% | 20% |
+|---|---|---|---|---|
+| target proxy computed from the answer | 6/6 | 6/6 | 0/6 | 0/6 |
+| reason code filled in for one class | 6/6 | 6/6 | 6/6 | 6/6 |
+| measurement never taken when it happened | 6/6 | 6/6 | 6/6 | 6/6 |
+| the answer plus noise | 6/6 | 6/6 | 6/6 | 3/6 |
+
+**81 of 96 planted leaks found (84%) across six real datasets.** Reported per
+family and per strength on purpose, because one recall percentage hides a whole
+family being invisible — which is exactly what this found on its first run. The
+`reason code` row was 0/6 at every strength below full, in all six datasets:
+the check meant to catch it was gated behind the AUC threshold whose dilution
+it existed to see past. That row is the fix.
+
+The remaining hole is honest and open: a numeric column with pure
+sub-populations is the same leak as a pure category, and only the categorical
+version is checked.
+
 Eight of those are ordinary supervised-learning sets in wide use with no
 leakage anyone has reported, and unlike iris and wine they carry the mess of
 real data: pandas `category` columns, heavy missingness, a 121-column frame,

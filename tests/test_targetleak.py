@@ -759,6 +759,66 @@ def test_pure_categories_name_the_categories(demo):
     assert "not_given" in f.evidence and "always" in f.evidence
 
 
+def test_a_pure_category_diluted_by_a_catch_all_default_is_still_found():
+    """The commonest real leak: a reason code filled in only for one outcome,
+    with a catch-all default on every other row. The pure part gives the answer
+    away; the mixed remainder drags the overall AUC below any threshold.
+
+    Measured on credit-g with this shape planted: 460 rows at 100% positive
+    under a 70% base rate, column AUC 0.83, and every check silent. The check
+    that exists for this was gated behind `score >= AUC_WARN` - the very
+    dilution it was written to see past.
+    """
+    rng = np.random.default_rng(3)
+    n = 1200
+    y = rng.integers(0, 2, n)
+    given = (y == 1) & (rng.random(n) < 0.55)   # only some positives
+    col = np.where(given, "reason_given", "not_applicable")
+    df = pd.DataFrame({"cancellation_reason": col,
+                       "tenure": rng.normal(size=n),
+                       "plan": rng.choice(list("abcd"), n), "y": y})
+    out = tl.analyse(df, "y")
+    pure = [f for f in out if f.kind == "pure-categories"
+            and f.column == "cancellation_reason"]
+    assert pure, [(f.kind, f.column) for f in out]
+    assert "reason_given" in (pure[0].evidence or "")
+    assert pure[0].fix, "a finding without a remedy is a scolding"
+
+
+def test_a_small_pure_category_of_noise_does_not_fire():
+    """Purity alone is not evidence. Four categories of pure noise against a
+    balanced target will hand you a pure group now and then, and the base-rate
+    test is what separates that from a leak - the same test the missingness
+    check needed after it fired on 9 of 15 noise columns at a 1% base rate."""
+    rng = np.random.default_rng(4)
+    n = 1200
+    y = rng.integers(0, 2, n)
+    df = pd.DataFrame({f"c{i}": rng.choice(list("abcd"), n) for i in range(6)})
+    df["y"] = y
+    assert not [f for f in tl.analyse(df, "y") if f.kind == "pure-categories"], \
+        "noise must not produce a leak finding"
+
+
+def test_purity_share_sets_the_volume_not_the_gate():
+    """A column whose categories partition the whole target is that target.
+    One pure category among mixed ones is a leak on a subset - reported, but
+    as something to confirm rather than something asserted."""
+    rng = np.random.default_rng(5)
+    n = 1200
+    y = rng.integers(0, 2, n)
+    whole = pd.DataFrame({"code": np.where(y == 1, "yes", "no"),
+                          "x": rng.normal(size=n), "y": y})
+    part = pd.DataFrame({"code": np.where((y == 1) & (rng.random(n) < 0.5),
+                                          "yes", "unknown"),
+                         "x": rng.normal(size=n), "y": y})
+    sev = {}
+    for name, frame in (("whole", whole), ("part", part)):
+        f = [x for x in tl.analyse(frame, "y") if x.kind == "pure-categories"]
+        assert f, f"{name}: expected a finding"
+        sev[name] = f[0].severity
+    assert sev == {"whole": "critical", "part": "warning"}, sev
+
+
 def test_missingness_evidence_is_a_crosstab():
     rng = np.random.default_rng(8)
     n = 800

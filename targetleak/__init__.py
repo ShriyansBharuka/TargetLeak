@@ -895,16 +895,28 @@ def _evidence_pure(col, y, limit=5):
 
 
 def _category_purity(col, y):
-    """Largest share of rows sitting in perfectly-pure, well-supported categories."""
+    """Share of rows in perfectly-pure categories, and the least likely of them.
+
+    Returns `(share, biggest_pure_n, its_target_value)`. The second and third
+    are what makes this testable: a pure category is evidence in its own right
+    and its significance follows from its SIZE against the base rate, exactly
+    as for a missingness group. The share alone cannot be tested against
+    anything.
+    """
     yb = pd.Series(np.asarray(y))
     # Group the integer codes, not the values: identical grouping (factorize
     # and groupby agree on dropping nulls) without materialising a whole
     # column of Python objects, which costs more than the grouping itself.
     codes, _ = pd.factorize(col, use_na_sentinel=True)
     keep = codes >= 0
-    g = yb[keep].groupby(codes[keep], sort=False).agg(["count", "nunique"])
+    g = yb[keep].groupby(codes[keep], sort=False).agg(
+        ["count", "nunique", "first"])
     pure = g[(g["count"] >= MIN_CATEGORY_SUPPORT) & (g["nunique"] == 1)]
-    return float(pure["count"].sum() / len(col)) if len(col) else 0.0
+    if not len(col) or pure.empty:
+        return 0.0, 0, None
+    share = float(pure["count"].sum() / len(col))
+    top = pure.loc[pure["count"].idxmax()]
+    return share, int(top["count"]), top["first"]
 
 
 def analyse(df, target, split=None, group=None, ignore=()):
@@ -1242,12 +1254,34 @@ def _column_findings(c, col, y, kind, n_features=1, varied_in_file=False):
             scored(_evidence(col, y, binary))))
 
     if not pd.api.types.is_numeric_dtype(col) or _looks_categorical(col):
-        purity = _category_purity(col, y)
-        if purity >= 0.5 and score >= AUC_WARN and z >= z_min:
+        purity, pure_n, pure_val = _category_purity(col, y)
+        # This used to require `score >= AUC_WARN`, which gated the check
+        # behind the very dilution it exists to see past. A reason code filled
+        # in only for one outcome, with a catch-all default for everything
+        # else, is the commonest real leak there is - and on credit-g a planted
+        # one with 460 rows at 100% positive under a 70% base rate scored 0.83
+        # overall and was reported as nothing at all. The pure part is a hard
+        # leak; the mixed remainder was hiding it.
+        #
+        # Significance comes from the size of the pure group against the base
+        # rate, as it already does for a missingness group: 0.7 ** 460 is not
+        # a number that happens. Without that test, purity alone fires on
+        # small categories of noise.
+        p_null = 1.0
+        if pure_n:
+            rate = float((pd.Series(np.asarray(y)) == pure_val).mean())
+            p_null = rate ** pure_n
+        if pure_n and p_null * max(n_features, 1) <= 0.01:
+            # The share decides how loud, the p-value decides whether to speak
+            # at all. Categories covering most of the frame ARE the target;
+            # one pure category among several mixed ones is a leak on a subset,
+            # which is worth confirming rather than asserting.
             findings.append(Finding(
-                "critical", "pure-categories", c,
+                "critical" if purity >= 0.5 else "warning", "pure-categories", c,
                 f"{purity:.0%} of rows fall in categories with exactly one "
-                "target value. The category encodes the answer.",
+                f"target value - the largest covers {pure_n:,} rows that are "
+                f"all {_plain(pure_val)!r}, a class making up {rate:.1%} of "
+                "the data. The category encodes the answer.",
                 _evidence_pure(col.astype("object"), y)))
 
     return findings
