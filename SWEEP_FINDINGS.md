@@ -14,8 +14,8 @@ the regression cases each entry specifies.
 | F3 | `audiology` refused by 0.6 of a row | **fixed** |
 | F4 | numeric percentage read as 56 unordered classes | **fixed** |
 | F5 | KDD98 183s — explained; the obvious optimisation is unsafe | won't fix, documented |
-| F6 | `group-overlap` fires on 280+ columns where the effect is zero | open |
-| F7 | ...and misses the actual entity column | open |
+| F6 | `group-overlap` fires on 280+ columns where the effect is zero | **fixed** |
+| F7 | ...and misses the actual entity column | **fixed** |
 | F8 | `underpowered` has no remediation text | open |
 | F9 | normalised floats read as discrete flags | **fixed** |
 | F10 | findings changed with the file format | **fixed** |
@@ -27,11 +27,26 @@ closed all five. F10's residual (`float64` behaving differently from `int64`
 at the same cardinality) fell out of the same fix once `_looks_categorical`
 stopped requiring an integer dtype.
 
-**F6 and F7 must be fixed together** and are not: F6 says the check fires on
-everything, F7 says it misses the entity, and they are the same mistake from
-two sides. Fixing F6 alone would quieten the noise and keep the blind spot.
-One of F7's two causes — the row-count term in `_looks_categorical` — is now
-gone; the check itself still tests the wrong quantity.
+**F6 and F7 were fixed together**, as one change, because they are the same
+mistake from two sides. The check tested overlap, which under a random split
+is fixed by rows-per-value and carries no information at all. It now asks the
+two questions that matter: does the value predict the target, and does it
+predict through *identity* rather than through a relationship that survives
+ordering. Measured against model-established gaps:
+
+| dataset | true gap | before | after |
+|---|---:|---:|---|
+| us_crime (`state`) | +0.0385 | **missed** | flags `state` |
+| KDD98 | +0.0021 | **280+ flagged** | silent |
+| SpeedDating | +0.0214 | 16 flagged | silent |
+| nyc-taxi (`DOLocationID`) | −0.0012 | flagged | still flagged |
+
+One measured false positive remains. `DOLocationID` has 259 levels and its
+identity does predict `tip_amount`, but grouping by it costs −0.0012 because
+that information is redundant with `trip_distance` and `fare_amount`. **No
+per-column rule can see redundancy against other features**, and the threshold
+was deliberately not tuned to hide it — that is the mistake the F2 fix has
+already made three times.
 
 **F2 is open on purpose.** Its proposed fix is on a third revision, each one
 broken by a dataset the previous version had not seen.

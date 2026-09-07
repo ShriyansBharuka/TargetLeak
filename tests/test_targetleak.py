@@ -1325,3 +1325,105 @@ def test_analyse_does_not_mutate_the_callers_frame():
     before = str(df["c"].dtype)
     tl.analyse(df, "y")
     assert str(df["c"].dtype) == before == "category"
+
+
+# --- F6 + F7: group-overlap tested the wrong quantity ------------------------
+# The old rule fired when >90% of the test side's values appeared on the train
+# side. Under a random split that is arithmetic, not evidence: a value seen 50
+# times lands on both sides with probability ~1. It flagged 280+ columns of
+# KDD98 where the model-measured cost of a random split was -0.0009, and
+# missed us_crime's `state`, where that cost was +0.0385.
+
+def test_an_ordinary_repeating_category_is_not_an_entity_leak():
+    """The F6 shape: a low-cardinality column whose values all straddle a
+    random split, carrying no target information. 100% overlap is guaranteed
+    here and means nothing."""
+    rng = np.random.default_rng(0)
+    n = 8000
+    y = rng.integers(0, 2, n)
+    df = pd.DataFrame({
+        "region": rng.integers(0, 40, n),        # 200 rows each, unrelated
+        "noise": rng.normal(size=n),
+        "y": y,
+    })
+    df["_sp"] = np.where(rng.random(n) < 0.8, "tr", "te")
+    out = tl.analyse(df, "y", split="_sp")
+    assert not [f for f in out if f.kind == "group-overlap"], \
+        [f.column for f in out if f.kind == "group-overlap"]
+
+
+def test_an_entity_whose_identity_predicts_the_target_is_flagged():
+    """The F7 shape: arbitrary codes that carry the answer. `state` in
+    us_crime scores 0.7558 by identity against 0.6053 by ordering."""
+    rng = np.random.default_rng(1)
+    n = 6000
+    ent = rng.integers(0, 60, n)
+    per_entity = rng.random(60)                  # each entity has its own rate
+    y = (rng.random(n) < per_entity[ent]).astype(int)
+    df = pd.DataFrame({"entity": ent, "noise": rng.normal(size=n), "y": y})
+    df["_sp"] = np.where(rng.random(n) < 0.8, "tr", "te")
+    go = [f.column for f in tl.analyse(df, "y", split="_sp")
+          if f.kind == "group-overlap"]
+    assert "entity" in go, go
+
+
+def test_a_strongly_predictive_feature_is_not_called_an_entity():
+    """Requiring only a high score flagged 66 of us_crime's columns, including
+    PctKids2Par at identity 0.8711 and ordering 0.8816. A feature predicts
+    through a relationship that survives ordering."""
+    rng = np.random.default_rng(2)
+    n = 6000
+    x = rng.normal(size=n)
+    y = (x + rng.normal(0, 0.4, n) > 0).astype(int)   # strong, ordered
+    df = pd.DataFrame({"strong": np.round(x, 1), "noise": rng.normal(size=n),
+                       "y": y})
+    df["_sp"] = np.where(rng.random(n) < 0.8, "tr", "te")
+    go = [f.column for f in tl.analyse(df, "y", split="_sp")
+          if f.kind == "group-overlap"]
+    assert "strong" not in go, go
+
+
+def test_a_handful_of_ordered_bins_is_not_an_entity():
+    """SpeedDating's `d_attractive_o` holds '[0-5]', '[6-8]', '[9-10]' - three
+    ordered bins. Non-numeric, so the identity margin cannot see the order;
+    the level count can."""
+    rng = np.random.default_rng(3)
+    n = 6000
+    x = rng.normal(size=n)
+    y = (x + rng.normal(0, 0.4, n) > 0).astype(int)
+    binned = pd.cut(x, 3, labels=["[0-5]", "[6-8]", "[9-10]"])
+    df = pd.DataFrame({"d_rating": binned, "y": y})
+    df["_sp"] = np.where(rng.random(n) < 0.8, "tr", "te")
+    go = [f.column for f in tl.analyse(df, "y", split="_sp")
+          if f.kind == "group-overlap"]
+    assert "d_rating" not in go, go
+
+
+def test_the_group_column_itself_is_checked_against_the_split():
+    """Passing --group excluded that column from the scan, so a user who named
+    both --split and --group never got the one sentence worth having."""
+    rng = np.random.default_rng(4)
+    n = 6000
+    ent = rng.integers(0, 60, n)
+    per_entity = rng.random(60)
+    y = (rng.random(n) < per_entity[ent]).astype(int)
+    df = pd.DataFrame({"site": ent, "noise": rng.normal(size=n), "y": y})
+    df["_sp"] = np.where(rng.random(n) < 0.8, "tr", "te")
+    go = [f.column for f in tl.analyse(df, "y", split="_sp", group="site")
+          if f.kind == "group-overlap"]
+    assert "site" in go, go
+
+
+def test_identity_signal_separates_entities_from_features():
+    rng = np.random.default_rng(5)
+    n = 5000
+    ent = rng.integers(0, 50, n)
+    per_entity = rng.random(50)
+    y = pd.Series((rng.random(n) < per_entity[ent]).astype(int))
+    ident, order = tl._identity_signal(pd.Series(ent), y, "binary")
+    assert ident - order >= tl.GROUP_IDENTITY_MARGIN, (ident, order)
+
+    x = rng.normal(size=n)
+    yy = pd.Series((x + rng.normal(0, 0.4, n) > 0).astype(int))
+    i2, o2 = tl._identity_signal(pd.Series(np.round(x, 1)), yy, "binary")
+    assert i2 - o2 < tl.GROUP_IDENTITY_MARGIN, (i2, o2)

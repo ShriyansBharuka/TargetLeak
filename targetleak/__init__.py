@@ -50,6 +50,22 @@ MAX_CLASSES = 100
 # to predictors alike (120 of us_crime's 126 normalised floats were read as
 # discrete flags, producing 111 findings and no usable verdict).
 NUMERIC_CLASS_MAX = 15
+# An entity only leaks through a random split if knowing the entity tells you
+# the target. Calibrated against model-measured split-dependence: us_crime's
+# `state` scores 0.7558 and grouping by it is worth 0.0385 of real score,
+# while the 280+ columns the old overlap rule flagged on KDD98 all sit at
+# 0.51-0.53 with a measured effect of -0.0009.
+GROUP_LEAK_SCORE = 0.65
+# ...and it must predict through IDENTITY rather than through a relationship,
+# or every strongly predictive feature gets called an entity. Requiring the
+# score alone flagged 66 of us_crime's columns; requiring this margin between
+# the target-encoded score and the raw-rank score leaves `state` alone.
+GROUP_IDENTITY_MARGIN = 0.15
+# An identifier has many levels; a binned feature has a handful. SpeedDating's
+# `d_attractive_o` holds '[0-5]', '[6-8]', '[9-10]' - three ordered bins, and
+# non-numeric, so the identity margin above cannot see they are ordered. The
+# level count can.
+GROUP_MIN_LEVELS = 20
 # Above this share of distinct values a target is not a label at all - it is
 # free text or an identifier pointed at the wrong column. Replaces a
 # rows-per-class floor that refused 24-class audiology by 0.6 of a row,
@@ -1179,6 +1195,50 @@ def _is_timelike(col):
     return bool(parsed.notna().mean() > 0.9)
 
 
+def _identity_signal(col, y, kind):
+    """(identity_score, order_score) - how the column predicts, not how well.
+
+    An entity identifier predicts by being memorised: its target-encoded
+    score is high while its raw ranks say nothing, because the codes are
+    arbitrary labels. A feature predicts through a relationship that survives
+    ordering, so both scores agree. Measured on us_crime:
+
+        state          identity 0.7558   order 0.6053   +0.1506  <- entity
+        population     identity 0.6597   order 0.6862   -0.0265  <- feature
+        PctKids2Par    identity 0.8711   order 0.8816   -0.0105  <- feature
+
+    `order` is None for a non-numeric column, where there is no meaningful
+    order to compare against and identity is all there is.
+    """
+    yv = np.asarray(y)
+    numeric = pd.api.types.is_numeric_dtype(col)
+
+    def pair(ind):
+        enc = _separation(_auc(_oof_target_encode(col, ind), ind))
+        raw = _separation(_auc(col, ind)) if numeric else None
+        return enc, raw
+
+    if kind == "binary":
+        classes = sorted(pd.Series(y).dropna().unique())
+        return pair((pd.Series(y) == classes[-1]).astype(int).to_numpy())
+    if kind == "multiclass":
+        best = (0.5, None)
+        for cls in sorted(pd.Series(y).dropna().unique(), key=repr):
+            e, r = pair((pd.Series(y) == cls).astype(int).to_numpy())
+            if e > best[0]:
+                best = (e, r)
+        return best
+    yy = pd.Series(yv, index=col.index)
+
+    def scaled(v):
+        return None if v is None or pd.isna(v) else 0.5 + min(abs(float(v)),
+                                                              0.999999) / 2
+    enc = scaled(pd.Series(_oof_target_encode(col, yv)).corr(yy,
+                                                             method="spearman"))
+    raw = scaled(pd.Series(col).corr(yy, method="spearman")) if numeric else None
+    return (enc if enc is not None else 0.5), raw
+
+
 def _split_checks(df, target, split, features, group):
     """Contamination between the two sides of a user-provided split."""
     out = []
@@ -1212,23 +1272,79 @@ def _split_checks(df, target, split, features, group):
                 f"rows in {parts[0]!r} ({shared / max(len(b), 1):.1%} of that side). "
                 "The model has already seen its own test set."))
 
-    for c in feat:
+    # --- entities spanning the split -------------------------------------
+    #
+    # This used to fire when >90% of the test side's values also appeared on
+    # the train side. That quantity carries no information: a random split IS
+    # the null, so observed overlap always equals its expected value, which is
+    # fixed by rows-per-value alone. A value appearing 50 times lands on both
+    # sides with probability ~1.
+    #
+    #     rows/value      1       2       5      50     400
+    #     overlap     54.1%   80.4%   97.7%  100.0%  100.0%
+    #
+    # So it flagged 280+ columns of KDD98 while the measured cost of using a
+    # random split there was -0.0009 - and it *missed* ZIP at 3 rows/value,
+    # the most entity-like column present, because entity ids straddle less.
+    # The rule was anti-correlated with its own purpose.
+    #
+    # A random split only leaks through an entity if knowing the entity tells
+    # you the target. That is measurable, and it separates the cases cleanly
+    # against the model-measured split-dependence gaps:
+    #
+    #     us_crime.state           score 0.7558   gap +0.0385   <- the miss
+    #     nyc-taxi.PULocationID    score 0.5974   gap +0.0032
+    #     SpeedDating.wave         score 0.5539   gap +0.0214
+    #     KDD98.STATE              score 0.5239   gap +0.0021
+    #     KDD98.AGE901/DMA/EC1     score 0.52-0.53   (falsely flagged before)
+    #     KDD98.ZIP                score 0.5076
+    #
+    # The group column is scanned too. Excluding it meant a user who named
+    # both --split and --group never got the one sentence worth having: your
+    # split does not respect the group you gave me.
+    y = df[target]
+    kind = _target_kind(y)
+    scanned = list(features) + ([group] if group and group in df.columns
+                                and group not in features else [])
+    for c in scanned:
         col = df[c]
-        n_unique = col.nunique(dropna=True)
-        if not (3 <= n_unique <= len(df) * 0.5):
+        n_unique = int(col.nunique(dropna=True))
+        if n_unique < 2 or n_unique > len(df) * 0.5:
             continue
-        if pd.api.types.is_numeric_dtype(col) and not _looks_categorical(col):
+        if n_unique < GROUP_MIN_LEVELS:
+            continue          # a handful of levels is a category, not an id
+        rows_per_value = len(df) / max(n_unique, 1)
+        if rows_per_value < 2:
+            continue          # nothing repeats, so nothing can straddle
+        sa, sb = set(a[c].dropna().unique()), set(b[c].dropna().unique())
+        if not sb or not (sa & sb):
+            continue          # no value is on both sides
+        try:
+            m = _score_column(col, y, kind, len(scanned), n_unique)
+            identity, order = _identity_signal(col, y, kind)
+        except Exception:
             continue
-        sa, sb = set(a[c].dropna()), set(b[c].dropna())
-        if not sb:
+        if not m or m["z"] < m["z_min"] or identity < GROUP_LEAK_SCORE:
             continue
-        overlap = len(sa & sb) / len(sb)
-        if overlap > 0.9 and n_unique > 20:
-            out.append(Finding(
-                "warning", "group-overlap", c,
-                f"{overlap:.0%} of this column's values appear on both sides of "
-                "the split. If these are entities (user, patient, ticker), the "
-                "model memorises them - split by this column instead."))
+        # A feature predicts through a relationship that survives ordering; an
+        # entity predicts only by being memorised. Without this, PctKids2Par
+        # (identity 0.8711, order 0.8816) is called an entity.
+        if order is not None and identity - order < GROUP_IDENTITY_MARGIN:
+            continue
+        straddling = len(sa & sb)
+        out.append(Finding(
+            "warning", "group-overlap", c,
+            f"{straddling:,} of this column's {n_unique:,} values appear on "
+            f"both sides of the split, and knowing the value predicts the "
+            f"target at {identity:.4f}"
+            + (f" while its ordering predicts only {order:.4f}"
+               if order is not None else "")
+            + ". That is prediction by identity rather than by any "
+            "relationship - the model is scoring itself on entities it "
+            "trained on. Split by this column instead.",
+            {"kind": "score_only", "score": identity, "auc": None,
+             "metric": "identity", "z": m["z"], "z_min": m["z_min"],
+             "band": [0.5, GROUP_LEAK_SCORE, AUC_CRITICAL, 1.0]}))
     return out
 
 
