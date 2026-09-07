@@ -161,6 +161,26 @@ FIXES = {
         "with leaks. Leakage concentrates: one or two columns carrying the "
         "answer, not a hundred. Check the two or three strongest by hand, "
         "confirm they exist at prediction time, and ignore the tail.",
+    "ignored":
+        "Nothing to do - you asked for this column to be skipped. It is listed "
+        "so the suppression stays visible: a leak introduced here later will "
+        "not be reported, and a silent ignore list is how that goes unnoticed.",
+    "stale-ignore":
+        "Remove the names that no longer exist, or correct the spelling. An "
+        "ignore entry that outlives its column protects nothing while looking "
+        "like it does.",
+    "underpowered":
+        "Decide which of two things this is. If the column is plausibly a "
+        "leak, get more labelled rows - the score is there, the evidence is "
+        "not, and no threshold can manufacture it. If it is a legitimate "
+        "feature, nothing needs doing: this is the tool declining to call it a "
+        "leak on a sample this small, which is the behaviour you want.",
+    "healthy":
+        "Nothing to do. Worth remembering that this compares two numbers you "
+        "supplied and says nothing about the data behind them - a leak that "
+        "inflates both scores equally looks exactly like this.",
+    "scores":
+        "Context for the diagnosis above, not a finding in itself.",
     "unscoreable":
         "Flatten or encode the column if it matters - one value per cell. "
         "Otherwise ignore this: the column was skipped, nothing else was.",
@@ -375,8 +395,24 @@ def _target_kind(y):
     if n == 2:
         return "binary"
     if pd.api.types.is_numeric_dtype(s):
-        # Order is information. Only a handful of distinct values reads as codes.
-        return "multiclass" if n <= NUMERIC_CLASS_MAX else "continuous"
+        # Order is information, so a numeric target is continuous by default.
+        # Two exceptions, both about the values rather than the count:
+        #
+        #  - a handful of distinct values reads as codes either way;
+        #  - integer CLASS CODES are a complete consecutive run, while a
+        #    measurement has gaps. one-hundred-plants-margin labels its 100
+        #    species 1..100 with every value present; cpu_act's CPU percentage
+        #    spans 0..99 with only 56 of them occurring. Without this,
+        #    normalising the plants target out of its string dtype turned a
+        #    100-class problem into a regression and the report went silent.
+        if n <= NUMERIC_CLASS_MAX:
+            return "multiclass"
+        u = np.sort(s.unique())
+        integral = bool(np.all(u == np.round(u)))
+        if (integral and n <= MAX_CLASSES
+                and n == int(u[-1] - u[0]) + 1):
+            return "multiclass"
+        return "continuous"
     if n <= MAX_CLASSES and n / len(s) < TARGET_CARDINALITY_MAX:
         return "multiclass"
     return "unsupported"
@@ -469,17 +505,24 @@ def _score_column(col, y, kind, n_features=1, n_unique=None):
         because an encoding built from the target invalidates the analytic
         null SE, so the winner has to say how it was made.
         """
-        if pd.api.types.is_float_dtype(col):
-            return [(col, False)]             # encoding a float is meaningless
         if pd.api.types.is_datetime64_any_dtype(col):
             # Order is the whole signal in a timestamp, and every value is
             # distinct, so target encoding returns the global mean and scores
             # 0.5 - a date that ranks perfectly with the target read as noise.
             return [(col.astype("int64"), False)]
-        enc = (_oof_target_encode(col, target_vec), True)
+        out = []
         if pd.api.types.is_numeric_dtype(col):
-            return [(col, False), enc]
-        return [enc]
+            out.append((col, False))      # order carries information
+        # Target encoding needs values to repeat: on an all-distinct column it
+        # returns the global mean and measures nothing. That is a question
+        # about cardinality, not dtype - branching on is_float_dtype meant an
+        # int64 and a float64 column holding the same ten values got different
+        # candidate sets, so identical data came back critical from one and a
+        # warning from the other. The last of the storage-vs-content bugs.
+        n_vals = int(col.nunique(dropna=True)) if n_unique is None else n_unique
+        if n_vals * 2 <= len(col):
+            out.append((_oof_target_encode(col, target_vec), True))
+        return out or [(_oof_target_encode(col, target_vec), True)]
 
     def measure(target_ind):
         """Best AUC over the candidate encodings, with the null SE computed
@@ -537,14 +580,26 @@ def _score_column(col, y, kind, n_features=1, n_unique=None):
         n_cls = int(pd.Series(y).dropna().nunique())
         zmin = _z_min(max(n_features, 1) * max(n_cls, 1))
         best, best_auc, best_z, best_cls = 0.5, None, 0.0, None
+        every = []
         for cls in sorted(pd.Series(y).dropna().unique(), key=repr):
             ind = (pd.Series(y) == cls).astype(int).to_numpy()
             auc, sep, z = measure(ind)
+            every.append(sep)
             if sep > best:
                 best, best_auc, best_z, best_cls = sep, auc, z, cls
         label = _plain(best_cls)
+        # The max finds a leak that gives away a single class. The macro
+        # average says whether the column solves the TARGET or just that one
+        # class, and those deserve different severities: a copy of a 10-class
+        # label scores 1.0000 either way, while a leaf-margin feature that
+        # perfectly identifies one species of a hundred scores 0.9870 by max
+        # and 0.6823 by macro. Reporting both as critical produced 32 critical
+        # findings on a plant-classification set, all of them true and none of
+        # them leaks.
         return {"score": best, "auc": best_auc,
+                "macro": float(np.mean(every)) if every else 0.5,
                 "metric": f"AUC vs class {label!r}",
+                "class_count": len(every),
                 "z": best_z, "z_min": zmin}
 
     if kind == "continuous":
@@ -1148,7 +1203,7 @@ def _column_findings(c, col, y, kind, n_features=1, varied_in_file=False):
             "this small a column of pure noise reaches that score by luck, so "
             "it is reported without a severity rather than called a leak.",
             scored(_evidence(col, y, binary))))
-    elif score >= AUC_CRITICAL:
+    elif score >= AUC_CRITICAL and m.get("macro", score) >= AUC_CRITICAL:
         findings.append(Finding(
             "critical", "target-proxy", c,
             f"alone {strength}. One column solving the target means one of two "
@@ -1156,6 +1211,17 @@ def _column_findings(c, col, y, kind, n_features=1, varied_in_file=False):
             "known, or the problem really is this easy. Measurement cannot "
             "tell those apart - check when this value is written, and whether "
             "it exists unchanged at the moment you predict.",
+            scored(_evidence(col, y, binary))))
+    elif score >= AUC_CRITICAL:
+        # Near-perfect for ONE class of many, not for the target. Real, worth
+        # confirming, not a leak - which is what a critical would claim.
+        findings.append(Finding(
+            "warning", "suspiciously-predictive", c,
+            f"alone {strength}, but that is one class of "
+            f"{m.get('class_count', 0)}: averaged over all of them it "
+            f"separates the target at only {m.get('macro', score):.4f}. A leak "
+            "gives away the whole target; a good feature gives away one class. "
+            "Confirm this value exists at prediction time and move on.",
             scored(_evidence(col, y, binary))))
     else:
         findings.append(Finding(

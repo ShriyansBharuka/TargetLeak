@@ -417,8 +417,12 @@ def test_multiclass_target_is_handled_not_mislabelled():
                        "noise": rng.normal(size=n), "y": y})
     out = tl.analyse(df, "y")
     assert any("multiclass" in f.detail for f in out if f.kind == "target")
-    crit = {f.column for f in out if f.severity == "critical"}
-    assert "leaky" in crit and "noise" not in crit
+    # Reported, though as a warning: `leaky` here is y*10 plus noise, a noisy
+    # numeric copy of a nominal label, which is the shape macro severity
+    # cannot separate from a genuine one-class feature. See
+    # test_many_class_targets_are_supported for the reasoning.
+    loud = {f.column for f in out if f.severity in ("critical", "warning")}
+    assert "leaky" in loud and "noise" not in loud
 
 
 def test_multiclass_one_vs_rest_names_the_class():
@@ -427,7 +431,8 @@ def test_multiclass_one_vs_rest_names_the_class():
     y = rng.integers(0, 3, n)
     df = pd.DataFrame({"tells_class_2": (y == 2).astype(float)
                        + rng.normal(0, .01, n), "y": y})
-    f = next(x for x in tl.analyse(df, "y") if x.kind == "target-proxy")
+    f = next(x for x in tl.analyse(df, "y")
+             if x.kind in ("target-proxy", "suspiciously-predictive"))
     assert "class" in f.data["metric"]
     # numpy scalars repr as "np.int64(2)"; that must not reach a user.
     assert "np." not in f.data["metric"], f.data["metric"]
@@ -456,8 +461,16 @@ def test_many_class_targets_are_supported(n_classes):
                        "noise": rng.normal(size=n), "t": labels})
     out = tl.analyse(df, "t")
     assert any("multiclass" in f.detail for f in out if f.kind == "target")
-    crit = {f.column for f in out if f.severity == "critical"}
-    assert "leak" in crit and "noise" not in crit
+    # Flagged, but as a warning rather than a critical. This fixture is a
+    # NOISY numeric copy of a nominal label, and that is the case macro
+    # severity cannot resolve: ranks cannot separate a middle class from both
+    # tails, and the noise gives every row its own level so the encoding is
+    # useless too, leaving macro at ~0.77 - indistinguishable from
+    # mfeat.att6's 0.6823, which is a genuine feature. The trade is deliberate:
+    # under-stating severity on this shape, in exchange for not calling 32
+    # leaf-margin features "critical leaks" on a 100-species dataset.
+    loud = {f.column for f in out if f.severity in ("critical", "warning")}
+    assert "leak" in loud and "noise" not in loud
 
 
 def test_thin_classes_are_analysed_not_refused():
@@ -625,10 +638,82 @@ def test_detects_train_test_contamination(demo):
 # --- reporting contract ------------------------------------------------------
 
 def test_every_visible_kind_has_a_remedy(demo):
-    """A finding without a fix is a scolding. Fails when a kind is added
-    without remediation text."""
-    kinds = {f.kind for f in tl.analyse(demo, "churned")}
-    assert {k for k in kinds if k not in tl.FIXES} <= {"target"}
+    """A finding without a fix is a scolding. This used to check only the ~8
+    kinds the demo frame happens to emit, which the quality audit flagged as a
+    bad test - and it then let `underpowered` ship with no remediation at all,
+    so us_crime produced 111 findings and no guidance. Now it exercises every
+    kind the tool can emit and asserts the contract both ways."""
+    emitted = set()
+    rng = np.random.default_rng(0)
+
+    emitted |= {f.kind for f in tl.analyse(demo, "churned")}
+    emitted |= {f.kind for f in tl.diagnose(0.98, 0.71)}
+    emitted |= {f.kind for f in tl.diagnose(0.84, 0.79)}
+    emitted |= {f.kind for f in tl.diagnose(0.99, 0.98)}
+    emitted |= {f.kind for f in tl.diagnose(0.55, 0.54)}
+    emitted |= {f.kind for f in tl.diagnose(0.71, 0.78)}
+
+    # underpowered: rare event, perfect on very few rows
+    y = np.array([1] * 4 + [0] * 36)
+    emitted |= {f.kind for f in tl.analyse(
+        pd.DataFrame({"c": y + rng.normal(0, .01, 40), "y": y}), "y")}
+
+    # duplicate-rows, contamination, group-overlap, ignored, stale-ignore
+    n = 6000
+    ent = rng.integers(0, 60, n)
+    rate = rng.random(60)
+    yy = (rng.random(n) < rate[ent]).astype(int)
+    g = pd.DataFrame({"site": ent, "noise": rng.normal(size=n), "y": yy})
+    g["_sp"] = np.where(rng.random(n) < 0.8, "tr", "te")
+    emitted |= {f.kind for f in tl.analyse(g, "y", split="_sp", group="site",
+                                           ignore=["noise", "gone"])}
+    dup = pd.concat([demo.head(80), demo], ignore_index=True)
+    dup["_sp"] = ["te"] * 80 + ["tr"] * len(demo)
+    emitted |= {f.kind for f in tl.analyse(dup, "churned", split="_sp")}
+
+    # dead-on-labelled-rows and mostly-null target
+    t = np.full(600, np.nan); t[:300] = rng.integers(0, 2, 300)
+    emitted |= {f.kind for f in tl.analyse(pd.DataFrame({
+        "dead": np.concatenate([np.zeros(300), rng.normal(size=300)]),
+        "flat": np.zeros(600), "ok": rng.normal(size=600), "t": t}), "t")}
+
+    # unscoreable
+    emitted |= {f.kind for f in tl.analyse(pd.DataFrame({
+        "emb": [[1.0, 2.0]] * 200, "f": rng.normal(size=200),
+        "y": rng.integers(0, 2, 200)}), "y")}
+
+    # duplicate-rows and train-test-contamination: genuinely identical rows
+    d = demo.head(120)
+    emitted |= {f.kind for f in tl.analyse(
+        pd.concat([d, demo], ignore_index=True), "churned")}
+
+    # missingness-leak: populated for one class only
+    n2 = 1400
+    y2 = (rng.random(n2) > 0.4).astype(int)
+    body = np.full(n2, np.nan)
+    body[np.flatnonzero(y2 == 0)[:140]] = rng.normal(size=140)
+    emitted |= {f.kind for f in tl.analyse(pd.DataFrame(
+        {"body": body, "f": rng.normal(size=n2), "y": y2}), "y")}
+
+    # suspicious-name, plus a score inside the 0.90-0.98 warning band
+    n3 = 3000
+    y3 = rng.integers(0, 2, n3)
+    emitted |= {f.kind for f in tl.analyse(pd.DataFrame({
+        "label_other": rng.normal(size=n3),
+        "borderline": y3 * 2.4 + rng.normal(0, 1, n3),   # ~0.956
+        "y": y3}), "y")}
+
+    # widespread-separability: many columns each individually predictive
+    n4 = 1200
+    y4 = rng.integers(0, 2, n4)
+    wide = {f"f{i}": y4 * 8.0 + rng.normal(0, 0.4, n4) for i in range(20)}
+    wide["y"] = y4
+    emitted |= {f.kind for f in tl.analyse(pd.DataFrame(wide), "y")}
+
+    missing = {k for k in emitted if k not in tl.FIXES} - {"target", "split"}
+    assert not missing, f"kinds emitted with no remediation text: {missing}"
+    unreachable = set(tl.FIXES) - emitted
+    assert not unreachable, f"FIXES keys no test reaches: {unreachable}"
 
 
 def test_report_wraps_and_deduplicates_fixes(demo):
@@ -1240,22 +1325,41 @@ def test_findings_survive_a_csv_round_trip_for_numeric_categories(tmp_path):
     (2, "binary"), (10, "multiclass"), (15, "multiclass"),
     (16, "continuous"), (56, "continuous"), (98, "continuous"),
 ])
-def test_numeric_target_kind_turns_on_order_not_a_class_ceiling(distinct, expected):
-    """F4. A numeric target with many distinct values is a measurement whose
-    ORDER is information. cpu_act's 56-value CPU percentage was read as 56
-    unordered classes and produced 4 false criticals; us_crime's float64
-    crime rate with 98 distinct values got the same treatment."""
+def test_a_gappy_numeric_target_is_a_measurement(distinct, expected):
+    """F4. A numeric target with many distinct values and GAPS between them is
+    a measurement whose order is information. cpu_act's CPU percentage spans
+    0..99 with only 56 values occurring, and was read as 56 unordered classes,
+    producing 4 false criticals; us_crime's float64 crime rate got the same
+    treatment."""
     rng = np.random.default_rng(2)
     n = distinct * 60
-    y = pd.Series(rng.integers(0, distinct, n).astype(float))
+    # Sample `distinct` values out of a wider range, so the run has gaps.
+    pool = rng.choice(distinct * 3, size=distinct, replace=False)
+    y = pd.Series(rng.choice(pool, size=n).astype(float))
+    assert y.nunique() == distinct
     assert tl._target_kind(y) == expected
+
+
+@pytest.mark.parametrize("k", [16, 56, 100])
+def test_a_complete_consecutive_run_is_class_codes(k):
+    """The other side. one-hundred-plants-margin labels its 100 species 1..100
+    with every value present - class codes, not a measurement. Normalising
+    that target out of its string dtype had turned a 100-class problem into a
+    regression, and the report went silent."""
+    rng = np.random.default_rng(3)
+    y = pd.Series(np.concatenate([np.arange(1, k + 1),
+                                  rng.integers(1, k + 1, k * 40)]).astype(float))
+    assert y.nunique() == k
+    assert tl._target_kind(y) == "multiclass"
 
 
 def test_numeric_percentage_target_produces_no_false_criticals():
     """cpu_act's shape: an integer percentage with dozens of levels."""
     rng = np.random.default_rng(3)
     n = 8000
-    usr = rng.integers(0, 100, n).astype(float)
+    # cpu_act's actual shape: 0..99 with only ~56 of the values occurring.
+    pool = rng.choice(100, size=56, replace=False)
+    usr = rng.choice(pool, size=n).astype(float)
     df = pd.DataFrame({"a": usr * 0.4 + rng.normal(0, 25, n),
                        "b": rng.normal(size=n), "usr": usr})
     assert tl._target_kind(df["usr"]) == "continuous"
@@ -1427,3 +1531,43 @@ def test_identity_signal_separates_entities_from_features():
     yy = pd.Series((x + rng.normal(0, 0.4, n) > 0).astype(int))
     i2, o2 = tl._identity_signal(pd.Series(np.round(x, 1)), yy, "binary")
     assert i2 - o2 < tl.GROUP_IDENTITY_MARGIN, (i2, o2)
+
+
+
+def test_an_exact_copy_of_a_multiclass_label_stays_critical():
+    """The other side of the macro-severity trade. A real leak - a copy of the
+    label, not a noisy transform of it - has a macro one-vs-rest score of
+    1.0000 because the encoding recovers every class, so it stays critical.
+    Severity only softens where the evidence genuinely is one class of many."""
+    rng = np.random.default_rng(0)
+    n = 3000
+    y = rng.integers(0, 10, n)
+    df = pd.DataFrame({"copy_of_label": y.astype(float),
+                       "noise": rng.normal(size=n), "y": y})
+    m = tl._score_column(df["copy_of_label"], df["y"], "multiclass")
+    assert m["macro"] >= tl.AUC_CRITICAL, m
+    crit = {f.column for f in tl.analyse(df, "y") if f.severity == "critical"}
+    assert "copy_of_label" in crit and "noise" not in crit
+
+
+def test_one_class_of_many_is_a_warning_not_a_critical():
+    """F2's real fix. A column that perfectly identifies one class of a
+    hundred is a feature doing its job; reporting it with the same weight as
+    a column that solves the whole target produced 32 critical findings on a
+    plant-classification set, every one of them true and none of them a leak."""
+    rng = np.random.default_rng(1)
+    n = 4000
+    # 12 classes: comfortably a multiclass target. Above NUMERIC_CLASS_MAX an
+    # integer target is read as continuous, which is a separate judgement call
+    # documented on that constant.
+    y = rng.integers(0, 12, n)
+    df = pd.DataFrame({"finds_class_7": (y == 7).astype(float)
+                       + rng.normal(0, .01, n),
+                       "noise": rng.normal(size=n), "y": y})
+    m = tl._score_column(df["finds_class_7"], df["y"], "multiclass")
+    assert m["score"] >= tl.AUC_CRITICAL, "should still be detected"
+    assert m["macro"] < tl.AUC_CRITICAL, "but not across the whole target"
+    out = tl.analyse(df, "y")
+    by_col = {f.column: f for f in out if f.column == "finds_class_7"}
+    assert by_col["finds_class_7"].severity == "warning"
+    assert "one class of 12" in by_col["finds_class_7"].detail

@@ -10,13 +10,13 @@ the regression cases each entry specifies.
 | | finding | state |
 |---|---|---|
 | F1 | 26-class targets refused outright | **fixed** |
-| F2 | `widespread-separability` unreachable on narrow frames (7 instances) | open |
+| F2 | many-class datasets reported walls of critical findings (7 instances) | **fixed** |
 | F3 | `audiology` refused by 0.6 of a row | **fixed** |
 | F4 | numeric percentage read as 56 unordered classes | **fixed** |
 | F5 | KDD98 183s — explained; the obvious optimisation is unsafe | won't fix, documented |
 | F6 | `group-overlap` fires on 280+ columns where the effect is zero | **fixed** |
 | F7 | ...and misses the actual entity column | **fixed** |
-| F8 | `underpowered` has no remediation text | open |
+| F8 | `underpowered` (and `ignored`, `stale-ignore`) had no remediation text | **fixed** |
 | F9 | normalised floats read as discrete flags | **fixed** |
 | F10 | findings changed with the file format | **fixed** |
 | F11 | tank numbers read as years | **fixed** |
@@ -48,8 +48,22 @@ per-column rule can see redundancy against other features**, and the threshold
 was deliberately not tuned to hide it — that is the mistake the F2 fix has
 already made three times.
 
-**F2 is open on purpose.** Its proposed fix is on a third revision, each one
-broken by a dataset the previous version had not seen.
+**F2 turned out not to be about the widespread note at all.** Three revisions
+of that note were each broken by a dataset the previous one had not seen; the
+fourth attempt found the real cause. One-vs-rest keeps the best of K classes,
+so "near-perfect for species 47 of 100" was reported with the same weight as
+"this column is the answer". Severity now follows the macro-averaged score:
+a copy of a 10-class label scores 1.0000 by max and by macro, while a
+leaf-margin feature scores 0.9870 by max and 0.6823 by macro. Plants went from
+32 criticals to 0, mfeat from 4 to 0, shuttle from 5 to 0, and the benchmark's
+false positives from 7 to 2 - iris and wine to zero, which no threshold tuning
+was going to achieve honestly.
+
+One trade, made deliberately: a *noisy numeric copy* of a nominal label is now
+a warning rather than a critical, because ranks cannot separate a middle class
+from both tails and the noise defeats the encoding, leaving its macro
+indistinguishable from a genuine one-class feature. It is still reported, and
+an exact copy still reads critical.
 
 ---
 

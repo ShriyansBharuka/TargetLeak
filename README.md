@@ -140,6 +140,7 @@ data never leaves your runner; only the findings reach the comment.
 | `constant` | Features carrying no information at all |
 | `dead-on-labelled-rows` | Features that vary in the file but not on labelled rows |
 | `underpowered` | Scores too high to ignore but on too little data to trust |
+| `group-overlap` | An entity whose *identity* predicts the target, spanning your split |
 | `widespread-separability` | So many columns are predictive that the problem is easy, not leaky |
 
 Binary, multiclass (one-vs-rest) and continuous targets. CSV, TSV, Parquet.
@@ -189,14 +190,14 @@ python benchmark/run_benchmark.py
 | dresses-sales | 500 | 12 | - | - | 0 |
 | SpeedDating | 8,378 | 120 | - | - | 2 |
 | churn | 5,000 | 20 | - | - | 0 |
-| iris | 150 | 4 | - | - | 2 |
-| wine | 178 | 13 | - | - | 3 |
+| iris | 150 | 4 | - | - | 0 |
+| wine | 178 | 13 | - | - | 0 |
 | breast_cancer | 569 | 30 | - | - | 0 |
 | digits | 1,797 | 64 | - | - | 0 |
 | diabetes | 442 | 10 | - | - | 0 |
 
-**Recall on documented leaks: 2/2. False positives on clean data: 7 across 358
-columns in 13 datasets (2.0%).**
+**Recall on documented leaks: 2/2. False positives on clean data: 2 across 358
+columns in 13 datasets (0.6%).**
 
 Eight of those are ordinary supervised-learning sets in wide use with no
 leakage anyone has reported, and unlike iris and wine they carry the mess of
@@ -214,12 +215,18 @@ only for people who did not survive. The other five ship with scikit-learn and
 are among the most-studied datasets in the field; if they leaked, it would be
 famous. Every critical finding there is counted against the tool.
 
-**The five false positives are real and are not going to be tuned away.** On
-iris, `petal length` gives AUC 1.0 against setosa. That is identical in every
-measurable respect to a leak — the difference is that iris is genuinely an easy
-problem, and no statistic can see the difference. It is the tool's central
-limitation, so the benchmark counts it as a failure rather than explaining it
-away, and a critical finding is worded to name both possibilities.
+iris and wine used to contribute five of these, and the fix was not to tune a
+threshold. On iris, `petal length` separates setosa perfectly — but that is
+*one class of three*, and averaged across all three it separates the target far
+less well. A leak gives away the whole target; a good feature gives away one
+class. Severity on a multiclass target now follows the macro-averaged
+one-vs-rest score rather than the best single class, so those become warnings
+that say so. The same change took a 100-species leaf dataset from 32 critical
+findings to zero, and every one of those 32 was true and none was a leak.
+
+**The two that remain are counted, not explained away.** On SpeedDating the
+name rule reads `expected_num_matches` as a sibling of the target `match`,
+when it is really a survey answer collected before the event.
 
 The benchmark also earned its place immediately: it caught a miss on `body`.
 That column identifies only 121 of 1,309 passengers, so its missingness AUC is
