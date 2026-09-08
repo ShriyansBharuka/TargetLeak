@@ -14,7 +14,7 @@ targetleak --demo
 
 ## Status: early, and here is exactly how early
 
-**0.2.0. Weeks old. Swept across ~100 real public datasets and run against one
+**0.3.0. Weeks old. Swept across ~100 real public datasets and run against one
 production dataset besides its own test suite.** Read the findings and apply
 your own judgement; that is a safe and useful way to use it today. What I would
 not do yet is wire it into a shared CI pipeline as a blocking gate before you
@@ -27,14 +27,15 @@ Three things worth knowing before you rely on it:
 - **The first four real datasets it met each exposed a bug the synthetic tests
   missed** - pandas 3 string dtypes, NaN targets being read as the negative
   class, an integer-cardinality cliff, and a leak covering only 121 rows. A
-  later sweep across ~100 more found eleven further problems, all of them
+  later sweep across ~100 more found twelve further problems, all of them
   fixed or documented in [`SWEEP_FINDINGS.md`](SWEEP_FINDINGS.md). Yours may
   still be the one that breaks it, but it is no longer the first hard one.
 - **Roughly 0.6% of clean columns get flagged** (2 of 358 in the benchmark
   below). Expect a little noise and expect to suppress the odd column.
 - **A clean report is not proof of absence.** It cannot tell a leak from a
   genuinely easy problem - see the benchmark, where that limitation is
-  measured rather than hidden.
+  measured rather than hidden. What it *can* tell you is measured too: 98% of
+  planted leaks found across four families and three split shapes.
 
 The most useful thing you can send is a dataset shape that crashes it or
 produces an obviously wrong finding.
