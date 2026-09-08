@@ -216,9 +216,27 @@ python benchmark/recall.py
 | measurement never taken when it happened | 6/6 | 6/6 | 6/6 | 6/6 |
 | the answer plus noise | 6/6 | 6/6 | 6/6 | 3/6 |
 
-**93 of 96 planted leaks found (97%) across six real datasets**, with the three
-misses all in the weakest row — a column separating the target at about 0.72,
-which is genuinely near the edge of what one column can show.
+The leaks that live in the split rather than in a column get the same
+treatment. These only run when you pass `--split`, so no amount of sweeping
+unlabelled data exercises them:
+
+| planted leak | | | |
+|---|---|---|---|
+| rows copied from train into test | 6/6 at 100% of test rows | 6/6 at 50% | 6/6 at 10% |
+| an entity whose identity predicts the target | 6/6 | 6/6 at 60% | |
+| a real date column under a random split | 6/6 | | |
+
+**129 of 132 planted leaks found (98%) across six real datasets**, with the
+three misses all in the weakest row — a column separating the target at about
+0.72, which is genuinely near the edge of what one column can show.
+
+Recall on its own would reward a check that fires on everything, so each split
+family has an innocent twin that has to stay quiet: an entity id spanning the
+split whose identity says nothing, and a split with no shared rows. **0 false
+alarms on those.** That guard is not hypothetical — `group-overlap` used to
+fire on 280+ columns of KDD98 by asking whether values straddled the split, a
+quantity fixed by rows-per-value that carries no information at all, and a
+recall-only benchmark would have called that version perfect.
 
 Reported per family and per strength on purpose, because one recall percentage
 hides a whole family being invisible — which is exactly what this found on its
