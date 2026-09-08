@@ -118,6 +118,23 @@ def test_names_catch_leaks_statistics_miss():
     ("sales_rolling_28d", "sales", None),             # ...and a rolling window
     ("churn_reason", "churned", "warning"),           # shares a stem
     ("plain_feature", "churned", None),
+    # A shared token that only says what KIND of thing a column is carries no
+    # information. Predicting `band_type` on cylinder-bands flagged
+    # `paper_type`, `ink_type` and `press_type` on the strength of "type" -
+    # three ordinary process attributes, printed beside seven real findings.
+    ("paper_type", "band_type", None),
+    ("press_type", "band_type", None),
+    ("type_on_cylinder", "band_type", None),
+    ("bounce_rate", "churn_rate", None),
+    ("fraud_flag", "default_flag", None),
+    ("other_score", "risk_score", None),
+    # ...while the subject token still carries the meaning, in both directions.
+    ("band_reason", "band_type", "warning"),
+    ("churn_reason", "churn_rate", "warning"),
+    # And a column that really is the target under another name is caught by
+    # the whole-name rule, which never consults the generic-token set.
+    ("risk_score_v2", "risk_score", "critical"),
+    ("band_type_raw", "band_type", "critical"),
 ])
 def test_suspicious_name_matching(column, target, expected):
     got = tl._suspicious_name(column, target)

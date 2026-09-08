@@ -711,6 +711,21 @@ _FUTURE_NAMES = ("future", "fwd", "forward", "ahead", "t_plus", "tplus",
                  "lead_", "_lead", "nextday", "next_day")
 _AFTER_NAMES = ("next_", "after_", "post_", "_post", "resolved", "final_")
 _GENERIC_TARGETS = {"target", "label", "y", "outcome", "class", "result", "value"}
+# Tokens that describe what KIND of thing a column is rather than what it is
+# about, so sharing one with the target is not evidence of anything. Predicting
+# `band_type` used to flag `paper_type`, `ink_type` and `press_type` on the
+# strength of the word "type" - three ordinary process attributes, reported
+# beside seven real findings, which is how a reader learns to skim the list.
+#
+# The subject token survives, and it is the one that carries the meaning:
+# `band_type` still flags anything containing "band", and a target `churn_rate`
+# still flags `churn_reason` while leaving `bounce_rate` alone. A column that
+# really is the target under another name is caught by the whole-name rule
+# above, which does not consult this set.
+_GENERIC_TOKENS = _GENERIC_TARGETS | {
+    "type", "kind", "category", "code", "name", "status", "flag", "group",
+    "number", "count", "index", "level", "score", "rate", "amount", "total",
+    "response", "measure", "metric", "field", "data", "info", "column"}
 # Names that mark a column as a PAST value of something. A lagged target is a
 # standard, legitimate feature; flagging it produces exactly the false positive
 # that gets a checker switched off.
@@ -762,11 +777,11 @@ def _suspicious_name(name, target=None):
         n_tokens = {p for p in n.replace("-", "_").split("_") if len(p) >= 4}
         # Matched both ways on purpose: a target 'churned' and a column
         # 'churn_reason' share a stem, and neither name contains the other.
-        for tok in t_tokens - _GENERIC_TARGETS:
+        for tok in t_tokens - _GENERIC_TOKENS:
             if tok in n:
                 return ("warning", f"shares the name {tok!r} with the target column. "
                                    "Often a variant or descendant of the answer.")
-        for tok in n_tokens - _GENERIC_TARGETS:
+        for tok in n_tokens - _GENERIC_TOKENS:
             if tok in t:
                 return ("warning", f"its name {tok!r} appears inside the target "
                                    "column's name. Often a variant of the answer.")
