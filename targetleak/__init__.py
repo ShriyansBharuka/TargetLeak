@@ -907,13 +907,21 @@ def _evidence_pure(col, y, limit=5):
 
 
 def _category_purity(col, y):
-    """Share of rows in perfectly-pure categories, and the least likely of them.
+    """Share of rows in perfectly-pure groups, and the most damning of them.
 
-    Returns `(share, biggest_pure_n, its_target_value)`. The second and third
-    are what makes this testable: a pure category is evidence in its own right
-    and its significance follows from its SIZE against the base rate, exactly
+    Returns `(share, n, target_value)` for the pure group least explicable by
+    chance among those covering PURE_MIN_SHARE of the rows. That last part is
+    what makes the check testable: a pure group is evidence in its own right
+    and its significance follows from its size against the base rate, exactly
     as for a missingness group. The share alone cannot be tested against
     anything.
+
+    Least likely rather than largest, because size and significance are not
+    the same thing. On adult with a review note planted, the biggest pure
+    group is 2,607 rows of '<=50K' - a class holding 75% of the data, so
+    0.75 ** 2607 - while the 1,800 rows of '>50K' at a 25% base rate are
+    0.25 ** 1800, some seven hundred orders of magnitude less likely. The
+    second is the one worth printing.
     """
     yb = pd.Series(np.asarray(y))
     # Group the integer codes, not the values: identical grouping (factorize
@@ -927,7 +935,17 @@ def _category_purity(col, y):
     if not len(col) or pure.empty:
         return 0.0, 0, None
     share = float(pure["count"].sum() / len(col))
-    top = pure.loc[pure["count"].idxmax()]
+    big = pure[pure["count"] >= PURE_MIN_SHARE * len(col)]
+    if big.empty:
+        # Nothing covers enough; hand back the largest so the caller's
+        # coverage gate rejects it on the same number it would have used.
+        top = pure.loc[pure["count"].idxmax()]
+        return share, int(top["count"]), top["first"]
+    # log space: rate ** n underflows to 0.0 for any group worth reporting,
+    # which would make every candidate compare equal.
+    rates = big["first"].map(lambda v: float((yb == v).mean()))
+    log_p = big["count"] * np.log(np.clip(rates.to_numpy(), 1e-300, None))
+    top = big.loc[log_p.idxmin()]
     return share, int(top["count"]), top["first"]
 
 
@@ -1308,10 +1326,10 @@ def _column_findings(c, col, y, kind, n_features=1, varied_in_file=False):
             findings.append(Finding(
                 "critical" if purity >= 0.5 else "warning", "pure-categories", c,
                 f"{purity:.0%} of rows sit in groups of one repeated value "
-                f"that carry exactly one target value - the largest covers "
-                f"{pure_n:,} rows, all {_plain(pure_val)!r}, a class making up "
-                f"{rate:.1%} of the data. The value gives the answer away on "
-                "the rows it covers.",
+                f"that carry exactly one target value. The least likely of "
+                f"them covers {pure_n:,} rows, all {_plain(pure_val)!r} - a "
+                f"class making up {rate:.1%} of the data. That value gives "
+                "the answer away on the rows it covers.",
                 _evidence_pure(col.astype("object"), y)))
 
     return findings
