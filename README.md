@@ -22,7 +22,7 @@ Colab.
 
 ## Status: early, and here is exactly how early
 
-**0.3.0. Weeks old. Swept across ~100 real public datasets and run against one
+**0.3.1. Weeks old. Swept across ~100 real public datasets and run against one
 production dataset besides its own test suite.** Read the findings and apply
 your own judgement; that is a safe and useful way to use it today. What I would
 not do yet is wire it into a shared CI pipeline as a blocking gate before you
