@@ -12,6 +12,14 @@ targetleak --demo
 
 > For `.parquet` files: `pip install "targetleak[parquet]"`
 
+**Want to see it work before installing it?**
+[`notebooks/find_the_leak.ipynb`](notebooks/find_the_leak.ipynb) plants a
+realistic leak in the Adult census data, measures the +0.06 AUC it steals from
+a cross-validated score, then finds it in under a second without training
+anything — and finishes on a dataset where nobody planted anything and seven
+columns turn out to leak through their missingness. Runs as-is on Kaggle or
+Colab.
+
 ## Status: early, and here is exactly how early
 
 **0.3.0. Weeks old. Swept across ~100 real public datasets and run against one
