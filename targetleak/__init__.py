@@ -144,8 +144,12 @@ FIXES = {
         "whole set before splitting, then split by entity or group rather "
         "than by row.",
     "group-overlap":
-        "Split on this column instead of at random - GroupKFold or "
-        "StratifiedGroupKFold - so no entity appears on both sides.",
+        "Decide first whether this column names a real entity - a user, a "
+        "patient, a store, a device. If it does, split on it with GroupKFold "
+        "or StratifiedGroupKFold so none appears on both sides, and compare "
+        "the score against your random split: the difference is what the "
+        "random split was lending you. If it is a measurement rather than an "
+        "entity, this finding is noise and belongs in --ignore.",
     "temporal-column":
         "Split by time, not at random: train on the past, test on the future. "
         "Then verify each feature is computed only from data available before "
@@ -1522,9 +1526,11 @@ def _split_checks(df, target, split, features, group):
             f"target at {identity:.4f}"
             + (f" while its ordering predicts only {order:.4f}"
                if order is not None else "")
-            + ". That is prediction by identity rather than by any "
-            "relationship - the model is scoring itself on entities it "
-            "trained on. Split by this column instead.",
+            + ". That fits an entity the model can memorise - but it also "
+            "fits a feature whose relationship to the target simply is not "
+            "monotonic, and this measurement cannot tell those apart. If rows "
+            "here share a real entity, split by it and see whether your score "
+            "drops; if it does, the random split was lending you that score.",
             {"kind": "score_only", "score": identity, "auc": None,
              "metric": "identity", "z": m["z"], "z_min": m["z_min"],
              "band": [0.5, GROUP_LEAK_SCORE, AUC_CRITICAL, 1.0]}))

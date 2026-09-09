@@ -8,9 +8,16 @@
 # unnoticed until a user hit it.
 #
 # So this deliberately installs the LATEST pandas and numpy rather than the
-# pinned versions, and runs against sixty real datasets. It is the one job in
+# pinned versions, and runs against ~100 real datasets. It is the one job in
 # this repository that is expected to break on its own one day; that is the
 # point of it.
+#
+# It also runs the two benchmarks that exit non-zero on a regression rather
+# than merely reporting: recall against planted leaks, and the name rule
+# against 24,000 real column names. Both of them have caught real bugs, and
+# both times a person ran them by hand. Scheduling them is the difference
+# between improvement that needs somebody's attention and improvement that
+# does not.
 name: sweep
 
 on:
@@ -25,7 +32,7 @@ permissions:
 jobs:
   sweep:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
         with:
@@ -64,6 +71,23 @@ jobs:
         continue-on-error: true
         run: python benchmark/sweep.py 2>&1 | tee sweep.log
 
+      # Recall and the name rule both exit non-zero on a regression, so they
+      # are gates rather than reports. They exist because the sweep is blind by
+      # construction: nobody has annotated these datasets, so it can never tell
+      # you a leak was MISSED. Every finding they caught - a whole leak family
+      # invisible below full strength, a CRITICAL on nyc-taxi's
+      # store_and_fwd_flag - was found by running them by hand. Running them
+      # here is what makes that continuous instead of occasional.
+      - name: Recall on planted leaks
+        id: recall
+        continue-on-error: true
+        run: python benchmark/recall.py 2>&1 | tee recall.log
+
+      - name: Name rule against real schemas
+        id: names
+        continue-on-error: true
+        run: python benchmark/name_rules.py 2>&1 | tee names.log
+
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -72,9 +96,11 @@ jobs:
             test.log
             bench.log
             sweep.log
+            recall.log
+            names.log
 
       - name: Report anything that broke
-        if: always() && (steps.tests.outcome == 'failure' || steps.bench.outcome == 'failure' || steps.sweep.outcome == 'failure')
+        if: always() && (steps.tests.outcome == 'failure' || steps.bench.outcome == 'failure' || steps.sweep.outcome == 'failure' || steps.recall.outcome == 'failure' || steps.names.outcome == 'failure')
         uses: actions/github-script@v7
         with:
           script: |
@@ -85,6 +111,8 @@ jobs:
               ['unit tests', '${{ steps.tests.outcome }}'],
               ['benchmark', '${{ steps.bench.outcome }}'],
               ['sweep', '${{ steps.sweep.outcome }}'],
+              ['recall', '${{ steps.recall.outcome }}'],
+              ['name rules', '${{ steps.names.outcome }}'],
             ].filter(([, o]) => o === 'failure').map(([n]) => n);
 
             const {owner, repo} = context.repo;
@@ -123,5 +151,5 @@ jobs:
             }
 
       - name: Fail the run if anything broke
-        if: steps.tests.outcome == 'failure' || steps.bench.outcome == 'failure' || steps.sweep.outcome == 'failure'
+        if: steps.tests.outcome == 'failure' || steps.bench.outcome == 'failure' || steps.sweep.outcome == 'failure' || steps.recall.outcome == 'failure' || steps.names.outcome == 'failure'
         run: exit 1

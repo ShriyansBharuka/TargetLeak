@@ -24,6 +24,68 @@ the regression cases each entry specifies.
 | F11 | tank numbers read as years | **fixed** |
 | F12 | `band_type` flagged `paper_type`, `ink_type`, `press_type` for the word "type" | **fixed** |
 | F13 | `store_and_fwd_flag` read as a forward-looking value — at critical | **fixed** |
+| F14 | `group-overlap` cannot separate an entity from a non-monotonic feature | won't fix, measured |
+
+## F14. The identity signal cannot do what it claims — measured, not argued
+
+`group-overlap` asks whether a column predicts by *identity* rather than
+through a relationship, and reports the ones that do as entities leaking
+across the split. Running the notebook exposed the doubt: `vehicle`'s
+`CIRCULARITY` and `segment`'s `vedge-mean` were being called entity ids, and
+they are ordinary geometric measurements. The reason is that the comparison
+was against rank *ordering*, and **a non-monotonic relationship is the normal
+case on a multiclass target** - a van sits between a bus and a saab on
+circularity, so ranking fails while identity succeeds.
+
+The obvious fix was to compare against magnitude instead: bin the column into
+coarse quantiles, since a measurement's information IS its magnitude while an
+identifier's is its exact value. It removed all four false positives.
+
+**Then `split_sensitivity.py` was expanded from 5 measurements to 23 to
+calibrate it, and the answer was no.** With six model-measured positives
+instead of one:
+
+| entity | gap | truth | identity | order margin | binned margin |
+|---|---:|---|---:|---:|---:|
+| Amazon `ROLE_FAMILY` | +0.2951 | leak | 0.6237 | 0.1188 | 0.0363 |
+| autos `make` | +0.2473 | leak | 0.7384 | None | None |
+| Amazon `ROLE_TITLE` | +0.2161 | leak | 0.6803 | 0.1594 | 0.1470 |
+| cylinder-bands `customer` | +0.0784 | leak | 0.6481 | None | None |
+| avocado `region` | +0.0731 | leak | 0.6935 | None | None |
+| us_crime `state` | +0.0385 | leak | 0.7558 | 0.1505 | 0.1117 |
+| SpeedDating `wave` | +0.0214 | none | 0.5539 | 0.0419 | 0.0361 |
+| nyc-taxi `DOLocationID` | +0.0071 | none | 0.7002 | 0.1566 | 0.1222 |
+| eucalyptus `Sp` | +0.0035 | none | 0.7549 | None | None |
+| KDD98 `STATE` | +0.0021 | none | 0.5239 | None | None |
+
+**`DOLocationID` is a negative that outranks `state`, a positive, on both
+metrics** - 0.1566 > 0.1505 by ordering and 0.1222 > 0.1117 by binning - and
+`Sp` outranks every positive on identity itself. No threshold on either signal
+separates these cases. Scored with the real score gate applied, the shipped
+rule gets 4 of 6 positives with 2 false positives; the binned version gets 2
+of 6 with 1. Halving recall on measured leaks to remove one false positive is
+the wrong trade for a leak detector, so the change was reverted.
+
+**Why no per-column rule can do this.** Whether grouping by a column costs you
+score depends on how redundant it is with the *other* features. `DOLocationID`
+genuinely predicts `tip_amount` by identity, but grouping by it costs −0.0012
+because `trip_distance` and `fare_amount` already carry that information. A
+rule that sees one column at a time cannot see redundancy, and this was
+already written down for that single case - six positives now show it was not
+a one-off excuse.
+
+**What changed instead: the finding stopped overclaiming.** It said *"That is
+prediction by identity rather than by any relationship - the model is scoring
+itself on entities it trained on. Split by this column instead."* It now names
+the ambiguity, says the measurement cannot resolve it, and tells the reader how
+to settle it in one run - group by the column and compare. The remedy leads
+with *decide whether this names a real entity*, and says plainly that if it is
+a measurement the finding is noise and belongs in `--ignore`.
+
+That is worth more than a tuned threshold. The tool's own README says it
+points and you decide; this check was the one place it forgot.
+
+---
 
 **Which instrument found what is worth recording**, because it decides where
 the next one should be pointed. F1–F11 came from the sweep. F0 came from
