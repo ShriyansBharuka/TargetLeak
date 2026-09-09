@@ -135,6 +135,15 @@ def test_names_catch_leaks_statistics_miss():
     # the whole-name rule, which never consults the generic-token set.
     ("risk_score_v2", "risk_score", "critical"),
     ("band_type_raw", "band_type", "critical"),
+    # A future-sounding word inside an unrelated term of art. `store and
+    # forward` is telemetry - whether a trip was held in vehicle memory before
+    # upload - and matching "fwd" in it produced a CRITICAL on nyc-taxi saying
+    # the test score could not be trusted. Found by benchmark/name_rules.py.
+    ("store_and_fwd_flag", "tip_amount", None),
+    ("forward_fill_count", "revenue", None),
+    # ...while a genuinely forward-looking name still reads critical.
+    ("fwd_return_5d", "revenue", "critical"),
+    ("future_price", "price_now", "critical"),
 ])
 def test_suspicious_name_matching(column, target, expected):
     got = tl._suspicious_name(column, target)

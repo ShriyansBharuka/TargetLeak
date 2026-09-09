@@ -247,6 +247,23 @@ fire on 280+ columns of KDD98 by asking whether values straddled the split, a
 quantity fixed by rows-per-value that carries no information at all, and a
 recall-only benchmark would have called that version perfect.
 
+The name rule fires on a string rather than on data, so neither the sweep nor
+the planted leaks reach it at all. It gets its own control:
+
+```bash
+python benchmark/name_rules.py
+```
+
+Every `(target, column)` pair in ~100 real datasets — **24,055 of them**, nearly
+all ordinary features. It fires on **3 (0.012%)**, each listed with a
+hand-checked verdict, so a change that adds a fourth fails the run instead of
+being spotted months later by a reader. Two of the three are the SpeedDating
+false positives already counted above; the third asks, at warning severity,
+whether a column called `SSLfinal_State` is known at prediction time.
+
+That control exists because this rule had already gone wrong twice and both
+times a human reading output caught it, not a test.
+
 Reported per family and per strength on purpose, because one recall percentage
 hides a whole family being invisible — which is exactly what this found on its
 first run, twice. `reason code` was 0/6 below full strength in all six

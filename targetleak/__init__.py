@@ -710,6 +710,15 @@ _LABEL_NAMES = ("label", "target", "outcome", "y_true", "ytrue", "ground_truth")
 _FUTURE_NAMES = ("future", "fwd", "forward", "ahead", "t_plus", "tplus",
                  "lead_", "_lead", "nextday", "next_day")
 _AFTER_NAMES = ("next_", "after_", "post_", "_post", "resolved", "final_")
+# Phrases where a future-sounding word is part of an unrelated term of art.
+# `store_and_fwd_flag` in the NYC taxi data records whether a trip was held in
+# vehicle memory before upload - telemetry, not a forward-looking value - and
+# matching "fwd" inside it produced a CRITICAL saying the test score could not
+# be trusted, on one of the most widely used public datasets there is. Same
+# mechanism as _LAG_NAMES: a naming convention that has to be exempted by name,
+# because the words alone read the other way.
+_NOT_FUTURE = ("store_and_fwd", "store_and_forward", "forward_fill",
+               "ffill", "forwarded_from", "port_forward")
 _GENERIC_TARGETS = {"target", "label", "y", "outcome", "class", "result", "value"}
 # Tokens that describe what KIND of thing a column is rather than what it is
 # about, so sharing one with the target is not evidence of anything. Predicting
@@ -766,7 +775,7 @@ def _suspicious_name(name, target=None):
         return ("critical", "the name says this is a label, not a feature. Another "
                             "label is still future information even when it "
                             "correlates only mildly with the one you are training on.")
-    if any(k in n for k in _FUTURE_NAMES):
+    if any(k in n for k in _FUTURE_NAMES) and not any(k in n for k in _NOT_FUTURE):
         return ("critical", "the name implies a forward-looking value. If it is "
                             "measured after the prediction moment it cannot be an input.")
     if any(k in n for k in _AFTER_NAMES):
