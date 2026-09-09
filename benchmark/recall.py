@@ -35,8 +35,26 @@ import pandas as pd
 sys.path.insert(0, ".")
 import targetleak as tl  # noqa: E402
 
-DATASETS = [("credit-g", 1), ("adult", 2), ("churn", 1), ("kc1", 1),
-            ("Australian", 4), ("bank-marketing", 1)]
+# Chosen for the shapes a leak has to survive, not for convenience. Six
+# datasets stood behind the first "98%" and every one of them was a modest
+# binary classification table - so the number said nothing about a continuous
+# target, a 100-class target, a frame that is mostly missing, or 1,776 columns.
+DATASETS = [
+    # binary, mixed dtypes - where this started
+    ("credit-g", 1), ("adult", 2), ("churn", 1), ("kc1", 1),
+    ("Australian", 4), ("bank-marketing", 1),
+    # imbalanced, where the base-rate gates get stressed
+    ("sick", 1), ("ozone-level-8hr", 1), ("click_prediction_small", 1),
+    # multiclass, including the class-count ceiling
+    ("vehicle", 1), ("segment", 1), ("letter", 1),
+    ("one-hundred-plants-margin", 1),
+    # continuous targets - a planted leak has to be found by group separation
+    # rather than by ranking, which is a different code path entirely
+    ("cpu_act", 1), ("us_crime", 2), ("cholesterol", 1),
+    # awkward: heavy missingness, extreme width, few rows, many categoricals
+    ("anneal", 1), ("Bioresponse", 1), ("dresses-sales", 1),
+    ("credit-approval", 1),
+]
 
 LOUD = ("target-proxy", "pure-categories", "missingness-leak",
         "suspiciously-predictive", "dead-on-labelled-rows")
@@ -53,64 +71,107 @@ def fetch(name, ver, cap=8000):
     return df, b.target.name
 
 
-def binarise(y):
-    """A 0/1 float so leak injection is arithmetic, whatever the source dtype."""
-    v = pd.Series(pd.factorize(y.astype(str))[0], index=y.index)
-    return (v == v.mode()[0]).astype(float)
+def answer(y):
+    """The target as a float that a planted column can be computed from.
+
+    This replaced `binarise`, which mapped the target to "is this the modal
+    class". On a binary frame those are nearly the same thing, and on anything
+    else they are not remotely: it made the planted leak encode one letter of
+    26, sixteen rows of 1,600 on a 100-class target, and SIX rows on
+    `cholesterol`, whose target has 152 distinct values. Then `analyse` was
+    handed the real target and asked to find a leak that was not there. Every
+    one of `cholesterol`'s sixteen "misses" was that, not the tool.
+
+    So: class codes for a classification target, the value itself for a
+    continuous one. A column built from this really is a copy of the answer.
+    """
+    if tl._target_kind(y) == "continuous":
+        v = pd.to_numeric(y, errors="coerce").astype(float)
+        return v.fillna(v.median())
+    return pd.Series(pd.factorize(y.astype(str))[0], index=y.index).astype(float)
 
 
-# Each planter returns the name of the column it made. `strength` is the share
-# of rows where the leak actually carries the answer; the rest is noise, so
-# 1.0 is a clean copy and 0.3 is a leak that only covers part of the data.
-def plant_proxy(df, y01, rng, strength):
-    """A column computed from the answer, e.g. a refund amount.
+def n_classes(y):
+    return 0 if tl._target_kind(y) == "continuous" else int(y.nunique(dropna=True))
 
-    OPEN: this family is missed below strength 0.7, and the reason is worth
-    stating rather than presenting as a threshold choice. Below that, 400-odd
-    rows hold exactly 0.0 or exactly 100.0 - pure sub-populations of a NUMERIC
-    column - while the rest is noise around 50. That is the pure-category case
-    in numeric clothing, and the purity check only runs on categoricals.
 
-    Part of the miss is this planter's fault: overwriting the leak with NOISE
-    is not how a partial proxy occurs in the wild. Real ones leave NaN on the
-    uncovered rows (the missingness check catches those, at every strength
-    here) or leave a zero. So do not read this row as "targetleak misses 60% of
-    proxies" - read it as one unimplemented check and one artificial planter.
+# Each planter returns the column it made, or None when the dataset cannot host
+# that leak at all - which is recorded as n/a and left out of the denominator,
+# because demanding a finding that is not there measures nothing. `strength` is
+# the share of rows on which the leak actually carries the answer, so 1.0 is a
+# clean copy and 0.2 is a leak covering a fifth of the data.
+def plant_proxy(df, a, rng, strength, y):
+    """A column computed from the answer - a refund amount, a risk tier.
+
+    For a classification target each class gets its own value, so this is a
+    copy of the WHOLE target rather than of one class. For a continuous target
+    it is the value itself, scaled.
     """
     mask = rng.random(len(df)) < strength
-    col = np.where(mask, y01 * 100.0, rng.normal(50, 30, len(df)))
-    df["refund_amount"] = col
+    scale = 100.0 if n_classes(y) else 1.0
+    noise = rng.normal(float(np.nanmean(a) * scale), float(np.nanstd(a) * scale) + 1.0,
+                       len(df))
+    df["refund_amount"] = np.where(mask, a * scale, noise)
     return "refund_amount"
 
 
-def plant_reason_code(df, y01, rng, strength):
-    """A category only filled in for one class - the commonest real leak."""
+def plant_reason_code(df, a, rng, strength, y):
+    """A category filled in from the outcome - the commonest real leak.
+
+    One value per class, so the categories partition the target. On a
+    continuous target the value is the decile, which is the same shape of
+    mistake a data engineer actually makes when bucketing an outcome.
+    """
+    k = n_classes(y)
+    if k:
+        if len(df) / k < 2 * tl.MIN_CATEGORY_SUPPORT:
+            return None      # too few rows per class to support any category
+        key = a
+    else:
+        key = pd.qcut(a, 10, labels=False, duplicates="drop").astype(float)
     mask = rng.random(len(df)) < strength
-    col = np.where((y01 == 1) & mask, "churn_reason_given", "not_applicable")
-    other = rng.random(len(df)) < 0.25
-    col = np.where((y01 == 0) & other, "no_contact", col)
+    col = np.where(mask, ["reason_" + str(int(v)) for v in key], "pending")
     df["cancellation_reason"] = col
     return "cancellation_reason"
 
 
-def plant_missingness(df, y01, rng, strength):
-    """A measurement that was never taken when the outcome occurred."""
-    mask = (y01 == 1) & (rng.random(len(df)) < strength)
+def plant_missingness(df, a, rng, strength, y):
+    """A measurement that was never taken once the outcome was known.
+
+    A NaN pattern is one bit, so it can only ever encode a binary split of the
+    target - it cannot give away a 100-class label, and asking it to would be
+    measuring nothing. So the leak marks one class, and the dataset has to have
+    enough rows in that class for the absence to be evidence at all. On
+    `one-hundred-plants-margin` that is 16 rows against a support floor of 20,
+    which is the tool being right, and the old version of this counted all four
+    strengths there as misses.
+    """
+    k = n_classes(y)
+    if k:
+        counts = pd.Series(a).value_counts()
+        target_val = counts.index[0]
+        if counts.iloc[0] * strength < 2 * tl.MIN_CATEGORY_SUPPORT:
+            return None
+        hit = (a == target_val).to_numpy()
+    else:
+        hit = (a > a.quantile(0.75)).to_numpy()
+    mask = hit & (rng.random(len(df)) < strength)
     col = rng.normal(10, 3, len(df))
     col[mask] = np.nan
     df["final_reading"] = col
     return "final_reading"
 
 
-def plant_noisy_proxy(df, y01, rng, strength):
+def plant_noisy_proxy(df, a, rng, strength, y):
     """The answer plus enough noise to look like a real feature."""
-    d = 1.0 + 4.0 * strength          # separation in SDs
-    df["risk_score"] = y01 * d + rng.normal(0, 1, len(df))
+    sd = float(np.nanstd(a)) or 1.0
+    d = (1.0 + 4.0 * strength) * sd / 2.0
+    df["risk_score"] = (a / sd) * d + rng.normal(0, 1, len(df))
     return "risk_score"
 
 
 PLANTERS = [("target proxy (exact)", plant_proxy),
-            ("reason code (one class)", plant_reason_code),
+            ("reason code (per class)", plant_reason_code),
             ("missingness", plant_missingness),
             ("noisy proxy", plant_noisy_proxy)]
 STRENGTHS = [1.0, 0.7, 0.4, 0.2]
@@ -124,7 +185,7 @@ STRENGTHS = [1.0, 0.7, 0.4, 0.2]
 # returns the finding kind it should produce, and is checked by kind because
 # contamination is a statement about the frame rather than about a column.
 
-def plant_contamination(df, y01, rng, strength, tgt):
+def plant_contamination(df, a, rng, strength, tgt):
     """Rows copied from train into test - the classic duplicated-row split."""
     n = len(df)
     is_test = rng.random(n) < 0.25
@@ -139,7 +200,7 @@ def plant_contamination(df, y01, rng, strength, tgt):
     return "train-test-contamination", tgt
 
 
-def plant_group_overlap(df, y01, rng, strength, tgt):
+def plant_group_overlap(df, a, rng, strength, tgt):
     """An entity whose identity predicts the target, split at random.
 
     The leak is not that the entity spans the split - under a random split
@@ -152,7 +213,10 @@ def plant_group_overlap(df, y01, rng, strength, tgt):
     # Entity identity carries the target for `strength` of the rows: rows whose
     # entity id is even are positive, the rest keep their real label.
     flip = rng.random(n) < strength
-    y_new = np.where(flip, (ent % 2 == 0).astype(float), y01)
+    # This one builds its own binary target on purpose, so the entity's
+    # identity is the only thing that decides it for `strength` of the rows.
+    base = (pd.Series(a) > pd.Series(a).median()).astype(float).to_numpy()
+    y_new = np.where(flip, (ent % 2 == 0).astype(float), base)
     df["account_id"] = [f"ACC{e:05d}" for e in ent]
     # The real target goes, or it sits in the frame as a perfect proxy for the
     # one we just built and every finding is about that instead.
@@ -162,7 +226,7 @@ def plant_group_overlap(df, y01, rng, strength, tgt):
     return "group-overlap", "_leaky_y"
 
 
-def plant_temporal(df, y01, rng, strength, tgt):
+def plant_temporal(df, a, rng, strength, tgt):
     """A real date column under a random split: training on the future."""
     n = len(df)
     days = np.sort(rng.integers(0, 900, n))
@@ -185,16 +249,24 @@ SPLIT_PLANTERS = [("train/test contamination", plant_contamination, [1.0, 0.5, 0
 # carries no information at all. A recall-only benchmark would have called that
 # version perfect.
 
-def control_innocent_entity(df, y01, rng, strength, tgt):
-    """An entity id spanning the split whose identity says nothing."""
+def control_innocent_entity(df, a, rng, strength, tgt):
+    """An entity id spanning the split whose identity says nothing.
+
+    The column matters, not just the kind. An earlier version of this control
+    asked only whether `group-overlap` fired anywhere in the report, and
+    counted six datasets as false alarms - but the findings were on `state`,
+    `CIRCULARITY` and `vedge-mean`, never on the planted id. `us_crime`'s
+    `state` has a model-measured +0.0385 split gap, so flagging it is the
+    check working, and the control was calling a true positive a failure.
+    """
     n = len(df)
     ent = rng.integers(0, max(n // 30, 20), n)
     df["account_id"] = [f"ACC{e:05d}" for e in ent]
     df["_split"] = np.where(rng.random(n) < 0.25, "test", "train")
-    return "group-overlap", tgt
+    return "group-overlap", tgt, None, "account_id"
 
 
-def control_clean_split(df, y01, rng, strength, tgt):
+def control_clean_split(df, a, rng, strength, tgt):
     """A split with no shared rows. Contamination must not be reported.
 
     The duplicates have to go first, and finding that out is why this control
@@ -221,12 +293,19 @@ def main():
         except Exception as e:
             print(f"  skip {name}: {type(e).__name__}")
             continue
-        y01 = binarise(df0[tgt])
+        a = answer(df0[tgt])
+        kind = tl._target_kind(df0[tgt])
+        print(f"  {name} ({kind}, {n_classes(df0[tgt]) or 'continuous'})")
         for label, plant in PLANTERS:
             for s in STRENGTHS:
                 rng = np.random.default_rng(0)
                 df = df0.copy()
-                col = plant(df, y01.to_numpy(), rng, s)
+                col = plant(df, a, rng, s, df0[tgt])
+                if col is None:
+                    # The dataset cannot host this leak - too few rows per
+                    # class for the evidence to exist. Not a miss.
+                    rows.append((label, s, name, "n/a"))
+                    continue
                 try:
                     out = tl.analyse(df, tgt)
                 except Exception as e:
@@ -244,16 +323,22 @@ def main():
                 try:
                     # A planter may hand back a replacement frame when it has
                     # to change the row set rather than just add columns.
-                    got = plant(df, y01.to_numpy(), rng, s, tgt)
+                    got = plant(df, a, rng, s, tgt)
                     want, use_tgt = got[0], got[1]
-                    df = got[2] if len(got) > 2 else df
+                    df = got[2] if len(got) > 2 and got[2] is not None else df
+                    # A fourth element pins the finding to one column. Without
+                    # it a control passes or fails on whether the KIND appeared
+                    # anywhere, which counted a correct finding on another
+                    # column as a false alarm.
+                    want_col = got[3] if len(got) > 3 else None
                     out = tl.analyse(df, use_tgt, split="_split",
                                      group="account_id"
                                      if "account_id" in df.columns else None)
                 except Exception as e:
                     rows.append((label, s, name, f"CRASH {type(e).__name__}"))
                     continue
-                hit = [f for f in out if f.kind == want]
+                hit = [f for f in out if f.kind == want
+                       and (want_col is None or f.column == want_col)]
                 sev = ("critical" if any(f.severity == "critical" for f in hit)
                        else "warning" if hit else "MISSED")
                 rows.append((label, s, name, sev))
@@ -262,7 +347,7 @@ def main():
     def table(planters, header, quiet_is_good=False):
         print(f"\n{header}")
         print(f"{'leak family':28}{'strength':>9}{'critical':>10}{'warning':>9}"
-              f"{'MISSED':>8}{'CRASH':>7}")
+              f"{'MISSED':>8}{'n/a':>6}{'CRASH':>7}")
         for entry in planters:
             label = entry[0]
             for s in (entry[2] if len(entry) > 2 else STRENGTHS):
@@ -270,13 +355,13 @@ def main():
                 if not sub:
                     continue
                 c, w = sub.count("critical"), sub.count("warning")
-                m = sub.count("MISSED")
+                m, na = sub.count("MISSED"), sub.count("n/a")
                 x = sum(1 for v in sub if v.startswith("CRASH"))
                 if quiet_is_good:
                     flag = "   ok" if not (c or w) else "   <-- FIRED"
                 else:
                     flag = "   <-- blind" if m and not (c or w) else ""
-                print(f"{label:28}{s:>9.1f}{c:>10}{w:>9}{m:>8}{x:>7}{flag}")
+                print(f"{label:28}{s:>9.1f}{c:>10}{w:>9}{m:>8}{na:>6}{x:>7}{flag}")
 
     table(PLANTERS, "leaks planted in a column")
     table(SPLIT_PLANTERS, "leaks planted in the split (analyse(..., split=...))")
@@ -284,10 +369,18 @@ def main():
           quiet_is_good=True)
 
     control_labels = {label for label, _, _ in CONTROLS}
-    planted = [r for r in rows if r[0] not in control_labels]
+    # n/a leaves the denominator. A dataset that cannot host a leak was never a
+    # test of whether the leak gets found, and counting it as a miss understates
+    # the tool exactly as counting it as a hit would overstate it.
+    planted = [r for r in rows
+               if r[0] not in control_labels and r[3] != "n/a"]
+    skipped = sum(1 for r in rows
+                  if r[0] not in control_labels and r[3] == "n/a")
     caught = sum(1 for r in planted if r[3] in ("critical", "warning"))
     print(f"\ndetected {caught}/{len(planted)} planted leaks "
-          f"({caught / max(len(planted), 1):.0%}) across {len(DATASETS)} datasets")
+          f"({caught / max(len(planted), 1):.0%}) across {len(DATASETS)} datasets"
+          + (f"; {skipped} scenarios n/a - the dataset cannot host that leak"
+             if skipped else ""))
     misses = [r for r in planted if r[3] not in ("critical", "warning")]
     if misses:
         print("\nnot found:")

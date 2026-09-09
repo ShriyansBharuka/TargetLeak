@@ -45,14 +45,65 @@ import pandas as pd
 sys.path.insert(0, ".")
 import targetleak as tl  # noqa: E402
 
-# (openml name, version, entity column, why it is an entity)
-GROUPED = [
-    ("SpeedDating", 1, "wave", "one speed-dating session; participants repeat"),
-    ("us_crime", 2, "state", "US state; communities share policy (regression)"),
-    ("KDD98", 1, "STATE", "US state across 191k donors"),
-    ("Amazon_employee_access", 1, "MGR_ID", "manager; reports share access"),
-    ("nyc-taxi-green-dec-2016", 2, "PULocationID", "pickup zone"),
-]
+# {(name, version): [(entity column, why it is an entity), ...]}
+#
+# Grouped by dataset so the fetch and parse of a large frame happen once rather
+# than once per entity column. The model fitting still runs per column, because
+# the feature matrix differs once the grouping column is dropped out of it.
+#
+# Expanded from five entries to twenty-three for one reason: `us_crime`'s
+# `state` was the only column in this project with a measured split gap, and a
+# single positive cannot calibrate a threshold. Column names were read off the
+# real frames rather than guessed, because `evaluate` skips a name it cannot
+# find and a guessed list measures nothing while looking like it ran.
+GROUPED = {
+    ("SpeedDating", 1): [
+        ("wave", "one speed-dating session; participants repeat"),
+    ],
+    ("us_crime", 2): [
+        ("state", "US state; communities share policy (regression)"),
+        ("county", "county code within state"),
+    ],
+    ("KDD98", 1): [
+        ("STATE", "US state across 191k donors"),
+        ("ZIP", "postcode - the most entity-like column present"),
+        ("DMA", "media market"),
+    ],
+    ("Amazon_employee_access", 1): [
+        ("MGR_ID", "manager; reports share access"),
+        ("RESOURCE", "the resource being requested"),
+        ("ROLE_TITLE", "job title"),
+        ("ROLE_FAMILY", "role family"),
+        ("ROLE_ROLLUP_1", "organisational rollup"),
+    ],
+    ("nyc-taxi-green-dec-2016", 2): [
+        ("PULocationID", "pickup zone"),
+        ("DOLocationID", "dropoff zone"),
+    ],
+    ("Airlines", 1): [
+        ("AirportFrom", "origin airport"),
+        ("AirportTo", "destination airport"),
+        ("Flight", "flight number - the same route repeats daily"),
+        ("Airline", "carrier"),
+    ],
+    ("avocado_sales", 1): [
+        ("region", "sales region (regression target)"),
+    ],
+    ("autos", 2): [
+        ("make", "manufacturer; models share engineering"),
+    ],
+    ("eucalyptus", 1): [
+        ("Sp", "species"),
+    ],
+    ("cylinder-bands", 2): [
+        ("customer", "print customer; jobs repeat"),
+        ("cylinder_number", "the physical cylinder"),
+    ],
+    ("seattlecrime6", 2): [
+        ("Beat", "police beat"),
+        ("Neighborhood", "neighborhood"),
+    ],
+}
 
 MIN_GAP = 0.03          # below this, the split choice made no real difference
 FOLDS = 4
@@ -142,14 +193,26 @@ def _score(X, y, splits, regression):
     return float(np.mean(out)) if out else float("nan")
 
 
+# The fetch is per DATASET, so it is cached; the model fitting is not, because
+# _prep leaves a different feature matrix behind for each entity column. This
+# saves the download and parse of a 191k-row frame five times over, nothing more.
+_FRAMES = {}
+
+
+def _frame(name, version):
+    if (name, version) not in _FRAMES:
+        from sklearn.datasets import fetch_openml
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            b = fetch_openml(name, version=version, as_frame=True,
+                             parser="pandas")
+        _FRAMES[(name, version)] = (b.frame, b.target.name)
+    return _FRAMES[(name, version)]
+
+
 def evaluate(name, version, group):
-    from sklearn.datasets import fetch_openml
     from sklearn.model_selection import GroupKFold, KFold
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore")
-        b = fetch_openml(name, version=version, as_frame=True, parser="pandas")
-    df = b.frame
-    target = b.target.name
+    df, target = _frame(name, version)
     if group not in df.columns:
         near = [c for c in df.columns if group.lower() in c.lower()]
         return {"skip": f"no column {group!r}" + (f" (similar: {near})" if near else "")}
@@ -171,6 +234,12 @@ def evaluate(name, version, group):
     if n_groups < MIN_GROUPS:
         return {"skip": f"only {n_groups} groups - too few to measure a gap"}
 
+    # Both baselines are recomputed per entity column, deliberately. It looked
+    # like the random-split score was a property of the dataset and could be
+    # cached across entity columns - but `_prep` drops whichever column is
+    # being grouped on, so X is genuinely a different feature matrix each
+    # time. Caching it would trade a correct measurement for a faster one, in
+    # the one harness whose entire job is to be right about small differences.
     random_splits = list(KFold(n_splits=FOLDS, shuffle=True,
                                random_state=0).split(X))
     grouped_splits = list(GroupKFold(n_splits=FOLDS).split(X, y, groups=g))
@@ -204,40 +273,55 @@ def main(argv=None):
     ap.add_argument("--limit", type=int)
     a = ap.parse_args(argv)
 
-    misses, ran = [], 0
-    for name, ver, group, why in (GROUPED[:a.limit] if a.limit else GROUPED):
-        print(f"\n{name}  (grouping on {group!r} - {why})")
-        try:
-            r = evaluate(name, ver, group)
-        except Exception as e:
-            print(f"  harness failed: {type(e).__name__}: {str(e)[:90]}")
-            continue
-        if "skip" in r:
-            print(f"  skipped: {r['skip']}")
-            continue
-        ran += 1
-        print(f"  {r['rows']:,} rows, {r['groups']} groups")
-        print(f"  random-split  {r['metric']:11} {r['random']:.4f}")
-        print(f"  grouped-split {r['metric']:11} {r['grouped']:.4f}")
-        print(f"  gap                       {r['gap']:+.4f}")
-        big = r["gap"] >= MIN_GAP
-        if big and r["warned"]:
-            print(f"  -> CORROBORATED: split-dependent, and targetleak flagged "
-                  f"{r['warned']}")
-        elif big:
-            print(f"  -> MISS: the random split was worth {r['gap']:.3f} and "
-                  "targetleak said nothing")
-            misses.append((name, r["gap"]))
-        elif r["warned"]:
-            print(f"  -> possible false positive: flagged {r['warned']} but the "
-                  "split choice barely mattered")
-        else:
-            print("  -> agreement: no gap, nothing flagged")
+    misses, ran, table = [], 0, []
+    items = list(GROUPED.items())[:a.limit] if a.limit else list(GROUPED.items())
+    for (name, ver), entities in items:
+        for group, why in entities:
+            print(f"\n{name}  (grouping on {group!r} - {why})")
+            try:
+                r = evaluate(name, ver, group)
+            except Exception as e:
+                print(f"  harness failed: {type(e).__name__}: {str(e)[:90]}")
+                continue
+            if "skip" in r:
+                print(f"  skipped: {r['skip']}")
+                continue
+            ran += 1
+            print(f"  {r['rows']:,} rows, {r['groups']} groups")
+            print(f"  random-split  {r['metric']:11} {r['random']:.4f}")
+            print(f"  grouped-split {r['metric']:11} {r['grouped']:.4f}")
+            print(f"  gap                       {r['gap']:+.4f}")
+            big = r["gap"] >= MIN_GAP
+            flagged = group in r["warned"]
+            table.append((name, group, r["gap"], flagged, r["warned"]))
+            if big and flagged:
+                print("  -> CORROBORATED: split-dependent, and this column was "
+                      "flagged")
+            elif big and r["warned"]:
+                print(f"  -> PARTIAL: split-dependent, but the finding is on "
+                      f"{r['warned']}, not on {group!r}")
+            elif big:
+                print(f"  -> MISS: the random split was worth {r['gap']:.3f} and "
+                      "targetleak said nothing")
+                misses.append((name, group, r["gap"]))
+            elif flagged:
+                print(f"  -> FALSE POSITIVE: flagged {group!r} but the split "
+                      "choice barely mattered")
+            else:
+                print("  -> agreement: no gap, nothing flagged")
 
-    print("\n" + "=" * 68)
-    print(f"{ran} datasets measured; misses worth investigating: {len(misses)}")
-    for n, gp in misses:
-        print(f"    {n}: {gp:+.4f} of unearned score")
+    # The point of the expansion: enough measured positives to calibrate the
+    # identity margin against, instead of one.
+    print("\n" + "=" * 72)
+    print(f"{'dataset':26}{'entity':18}{'gap':>9}  measured  flagged")
+    for name, group, gap, flagged, _ in sorted(table, key=lambda r: -r[2]):
+        print(f"{name[:25]:26}{group[:17]:18}{gap:>+9.4f}  "
+              f"{'LEAK' if gap >= MIN_GAP else 'none':8}  {'yes' if flagged else 'no'}")
+    pos = [t for t in table if t[2] >= MIN_GAP]
+    print(f"\n{ran} measurements; {len(pos)} with a real split gap "
+          f"(>= {MIN_GAP}); misses: {len(misses)}")
+    for n, g, gp in misses:
+        print(f"    {n} / {g}: {gp:+.4f} of unearned score, not flagged")
     return 0
 
 

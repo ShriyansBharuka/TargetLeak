@@ -95,6 +95,33 @@ def build_cases(with_network=True):
         ("dresses-sales", 1, "500 rows, 12 category columns, missingness"),
         ("SpeedDating", 1, "121 columns"),
         ("churn", 1, "imbalanced binary target"),
+
+        # Second round. Eight datasets is a thin denominator for a
+        # false-positive rate, and every one of the eight above is a modest
+        # binary table. Each of these was measured before being added rather
+        # than after - adding datasets and then counting whatever the tool
+        # says would assert they are leak-free without establishing it, which
+        # is the opposite of what a negative set is for.
+        ("spambase", 1, "57 features, word frequencies"),
+        ("phoneme", 1, "5 features, 5k rows"),
+        ("ionosphere", 1, "34 features, 351 rows"),
+        ("banknote-authentication", 1, "4 features, cleanly separable"),
+        ("qsar-biodeg", 1, "41 molecular descriptors"),
+        ("haberman", 1, "3 features, 306 rows - almost no power"),
+        ("cmc", 1, "3-class, integer-coded categoricals"),
+        ("pc4", 1, "software metrics, imbalanced"),
+        ("wilt", 1, "remote sensing, heavily imbalanced"),
+        ("blood-transfusion-service-center", 1, "4 features, 748 rows"),
+        ("climate-model-simulation-crashes", 1, "20 normalised parameters"),
+        ("balance-scale", 1, "synthetic, 3 classes"),
+        ("tic-tac-toe", 1, "9 categoricals, deterministic-ish target"),
+        ("vote", 1, "16 boolean votes with missingness"),
+        # Kept deliberately, and it is the only one of the fifteen that
+        # fires. `odor` separates edible from poisonous at AUC 0.9867 - the
+        # famous single-attribute rule - and it is a real observable feature,
+        # so it counts against the tool. Dropping the one dataset that fires
+        # is how a benchmark turns into a sales sheet.
+        ("mushroom", 1, "one feature nearly solves it, legitimately"),
     ]
     if with_network:
         for name, ver, note in real:

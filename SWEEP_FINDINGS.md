@@ -22,6 +22,41 @@ the regression cases each entry specifies.
 | F9 | normalised floats read as discrete flags | **fixed** |
 | F10 | findings changed with the file format | **fixed** |
 | F11 | tank numbers read as years | **fixed** |
+| F12 | `band_type` flagged `paper_type`, `ink_type`, `press_type` for the word "type" | **fixed** |
+| F13 | `store_and_fwd_flag` read as a forward-looking value — at critical | **fixed** |
+
+**Which instrument found what is worth recording**, because it decides where
+the next one should be pointed. F1–F11 came from the sweep. F0 came from
+`benchmark/recall.py`, which the sweep cannot substitute for: a sweep over
+unlabelled data can never tell you something was missed. F13 came from
+`benchmark/name_rules.py`.
+
+**F12 came from a person reading output**, which is the one to be uncomfortable
+about. Running the Kaggle notebook printed five `suspicious-name` warnings on
+`cylinder-bands` — `paper_type`, `ink_type`, `press_type`, `solvent_type`,
+`type_on_cylinder` — every one of them for sharing the word "type" with the
+target `band_type`, and three of them ordinary process attributes. Noise
+directly beside seven real findings is how a reader learns to skim the list.
+
+The token rule was subtracting the set that answers *is the whole target name
+generic*, so it contained only target-shaped words like `label` and `outcome`.
+Nothing told it that `type` describes a column's nature rather than its
+subject. A separate set now covers those, in both directions of the match —
+fixing only the forward one left all five warnings in place with a different
+sentence, which is how the second loop got found.
+
+F13 is the same class of bug caught the right way. `benchmark/name_rules.py`
+runs the rule over every `(target, column)` pair in ~100 real datasets, 24,055
+of them, and reported four firings. Three were known or defensible. The fourth,
+`store_and_fwd_flag` against `tip_amount` on nyc-taxi, matched "fwd" inside a
+telecom term of art: *store and forward* records whether a trip was held in
+vehicle memory before upload. It is telemetry, and the tool was saying the test
+score could not be trusted because of it, at **critical**, on one of the most
+widely used public datasets there is. Exempted by phrase, the same mechanism
+`_LAG_NAMES` already uses for `revenue_last_year`.
+
+Every remaining firing is now recorded with a verdict, so a fourth fails the
+run instead of waiting for the next careful reader.
 
 **F0 came from a different instrument.** The sweep looks for crashes, runtime
 and noise, so it is blind to a miss by construction - nobody has annotated
