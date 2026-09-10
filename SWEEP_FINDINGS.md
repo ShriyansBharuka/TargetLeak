@@ -26,6 +26,36 @@ the regression cases each entry specifies.
 | F13 | `store_and_fwd_flag` read as a forward-looking value — at critical | **fixed** |
 | F14 | `group-overlap` cannot separate an entity from a non-monotonic feature | won't fix, measured |
 | F15 | 29 rows of nyc-taxi outranked the column that contains the target | **fixed** |
+| F16 | *(benchmark)* the recall gate would have failed every week on one fixed-seed draw | **fixed** |
+
+## F16. The weekly gate would have failed forever on one unlucky draw
+
+*A defect in the benchmark, not the tool - recorded here because it would
+have broken the thing that keeps the tool honest.*
+
+The innocent-entity control fired on `anneal`: a pure-noise `account_id`,
+29 random levels, flagged as a `group-overlap` warning. Before touching the
+tool, the rate was measured - **200 fresh pure-noise ids on the same target
+cleared the gate zero times.** The control's own id had been a tail draw:
+against a five-class target with one class of 8 rows and one of 40, the best
+one-vs-rest score for class `U` landed at 0.7140, at z = 4.58 against a gate
+of 4.50. Nothing to fix in the tool, by the rule that a threshold does not
+move on fewer than several measured cases.
+
+The real bug was one layer up. The control uses a fixed seed, so that draw
+is identical on every run, and `recall.py` had just been wired into the
+weekly sweep as a gate that failed on **any** control alarm. It would have
+failed every Monday on the same draw and opened an issue nobody could close -
+which is how a gate gets deleted.
+
+A control exists to catch a *systematic* false positive, like the F6 version
+of `group-overlap` that fired on 280+ columns of KDD98 and would have lit up
+most of these datasets. Twenty draws cannot certify a one-in-a-hundred-thousand
+rate anyway. A control family now fails the run when it fires on more than 5%
+of datasets, and at least two. Computed rather than asserted: over 20
+datasets, a tool misfiring at 0.5% per draw passes 99.55% of the time, and one
+misfiring at 30% fails 99.24% of the time. The comment first drafted said
+99.9% for the second; it was checked before commit and corrected.
 
 ## F15. A 29-row group spoke for the whole column
 

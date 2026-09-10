@@ -36,15 +36,15 @@ Three things worth knowing before you rely on it:
   missed** - pandas 3 string dtypes, NaN targets being read as the negative
   class, an integer-cardinality cliff, and a leak covering only 121 rows. A
   sweep across ~100 more, plus the recall and name-rule benchmarks below,
-  have since found **fourteen** further problems - thirteen fixed, one
-  documented as a deliberate trade, each with its reproduction in
+  have since found **seventeen** further problems in the tool - fifteen
+  fixed, two measured and documented as limits, each with its reproduction in
   [`SWEEP_FINDINGS.md`](SWEEP_FINDINGS.md). Yours may still be the one that
   breaks it, but it is no longer the first hard one.
 - **Roughly 0.5% of clean columns get flagged** (3 of 628 in the benchmark
   below). Expect a little noise and expect to suppress the odd column.
 - **A clean report is not proof of absence.** It cannot tell a leak from a
   genuinely easy problem - see the benchmark, where that limitation is
-  measured rather than hidden. What it *can* tell you is measured too: **89%**
+  measured rather than hidden. What it *can* tell you is measured too: **91%**
   of planted leaks across four column families and three split shapes over 20
   datasets, and 20/20 when the leak is a clean copy of the answer.
 
@@ -235,9 +235,9 @@ python benchmark/recall.py
 | planted leak | full strength | covering 70% | 40% | 20% |
 |---|---|---|---|---|
 | target proxy computed from the answer | **20/20** | 17/20 | 15/20 | 14/20 |
-| reason code filled in from the outcome | **19/19** | 19/19 | 18/19 | 17/19 |
+| reason code filled in from the outcome | **19/19** | 19/19 | 17/19 | 14/19 |
 | measurement never taken when it happened | **19/19** | 19/19 | 19/19 | 17/19 |
-| the answer plus noise | 19/20 | 18/20 | 7/20 | 6/20 |
+| the answer plus noise | 19/20 | 18/20 | 16/20 | 11/20 |
 
 The leaks that live in the split rather than in a column get the same
 treatment. These only run when you pass `--split`, so no amount of sweeping
@@ -249,12 +249,12 @@ unlabelled data exercises them:
 | an entity whose identity predicts the target | 20/20 | 20/20 at 60% | |
 | a real date column under a random split | 20/20 | | |
 
-**383 of 432 planted leaks found (89%) across 20 real datasets**, with 8
+**393 of 432 planted leaks found (91%) across 20 real datasets**, with 8
 scenarios reported `n/a` because the dataset cannot host that leak at all — a
 NaN pattern is one bit and cannot give away a 100-class label, so demanding
 that it does would measure nothing.
 
-**That 89% replaces a 98%, and the drop is the honest part.** The old number
+**That 91% replaces a 98%, and the drop is the honest part.** The old number
 came from six datasets that were all modest binary tables, so it said nothing
 about a continuous target, a 100-class one, or a frame that is mostly missing.
 Expanding to 20 also exposed a bug in this benchmark: the planters keyed off
@@ -263,17 +263,24 @@ meant planting a column keyed to **6 rows out of 303** and then asking the tool
 to find a leak that was not there.
 
 Where the misses sit matters more than the total. **A clean copy of the answer
-is found 20/20, a reason code 19/19, a missingness leak 19/19.** Of the 49
-misses, 31 are `noisy proxy` at 40% coverage or less — a column separating the
-target at roughly 0.6, near the edge of what one column can show at all. The
-rest concentrate on continuous targets and on partial-coverage leaks against 26
-and 100 classes, which are the genuine weak spots and are printed by name every
-time the benchmark runs.
+is found 20/20, a reason code 19/19, a missingness leak 19/19.** Of the 39
+misses, **25 are on the three continuous targets** and 10 are partial-coverage
+leaks against 26 and 100 classes. Those are the genuine weak spots, and the
+benchmark prints every one of them by name each time it runs.
+
+The noisy-proxy row was itself wrong until this run. Its strength was set by
+the *target's units* rather than by the strength parameter: at "20% strength"
+on `cholesterol` it was a perfect copy of the answer, and at full strength on
+`us_crime` it barely correlated with it (0.43). It is standardised now, so the
+row measures the tool rather than the dataset.
 
 Recall on its own would reward a check that fires on everything, so each split
 family has an innocent twin that has to stay quiet: an entity id spanning the
 split whose identity says nothing, and a split with no shared rows. **1 false
-alarm across 40 controls**, on `anneal`. That guard is not hypothetical — `group-overlap` used to
+alarm across 40 controls**, on `anneal` - and 200 fresh pure-noise ids on that
+same target cleared the gate zero times, so it is one unlucky draw rather than a
+pattern. A control family fails the run only when it fires on more than one
+dataset in twenty, which catches a systematic misfire and forgives a tail. That guard is not hypothetical — `group-overlap` used to
 fire on 280+ columns of KDD98 by asking whether values straddled the split, a
 quantity fixed by rows-per-value that carries no information at all, and a
 recall-only benchmark would have called that version perfect.
