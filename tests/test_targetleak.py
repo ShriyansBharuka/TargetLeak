@@ -1558,6 +1558,47 @@ def test_a_normalised_float_is_not_a_discrete_flag():
     assert "Spearman" in m["metric"], m["metric"]
 
 
+def test_a_tiny_group_cannot_speak_for_a_whole_column():
+    """nyc-taxi: `extra` = 4.5 is 29 rows of 60,000 averaging a $10.94 tip
+    against about $2.40 elsewhere, so it separated at 0.9313 - and that
+    one group was reported as the column's score, above `total_amount` at
+    0.9110, which is the column that contains the tip. The same rule
+    `pure-categories` learned on riccardo: a group has to cover something."""
+    rng = np.random.default_rng(21)
+    n = 20_000
+    tip = rng.lognormal(0.7, 0.6, n)
+    surcharge = rng.choice([0.0, 0.5, 1.0], n, p=[0.45, 0.37, 0.18])
+    # 29 rows drawn from the top quarter of tips: strong but not perfect,
+    # which is what the real group was (0.9313). Drawing from the top 1%
+    # instead makes a near-perfect group - the case the exception exists to
+    # admit - and an earlier version of this fixture did exactly that.
+    rare = rng.choice(np.argsort(-tip)[:n // 4], 29, replace=False)
+    surcharge[rare] = 4.5
+    alone = tl._separation(tl._auc(pd.Series(tip),
+                                   (surcharge == 4.5).astype(int)))
+    assert 0.80 < alone < tl.AUC_CRITICAL, f"setup: rare group is {alone:.4f}"
+    m = tl._score_column(pd.Series(surcharge), pd.Series(tip), "continuous")
+    assert m["score"] < tl.AUC_WARN, m
+    assert not [f for f in tl.analyse(
+        pd.DataFrame({"extra": surcharge, "tip": tip}), "tip")
+        if f.column == "extra" and f.severity in ("critical", "warning")]
+
+
+def test_a_tiny_but_perfect_group_is_still_a_leak():
+    """The other side: coverage is waived for a group that separates
+    perfectly, because that is exactly the subset leak - 121 rows of `body`
+    on Titanic. A three-level code whose rarest level marks precisely the top
+    2% of the target must still read critical."""
+    rng = np.random.default_rng(22)
+    n = 6000
+    rev = rng.lognormal(3, 1, n)
+    code = rng.choice([0.0, 1.0], n)
+    code[np.argsort(-rev)[:120]] = 2.0            # 2%, perfectly the top
+    m = tl._score_column(pd.Series(code), pd.Series(rev), "continuous")
+    assert m["score"] >= tl.AUC_CRITICAL, m
+    assert "120 rows" in m["metric"], m["metric"]
+
+
 def test_a_genuine_flag_still_uses_group_separation():
     """The other side of F9: two-level predictors must keep the branch that
     catches a flag marking the top slice of a continuous target."""

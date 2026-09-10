@@ -25,6 +25,56 @@ the regression cases each entry specifies.
 | F12 | `band_type` flagged `paper_type`, `ink_type`, `press_type` for the word "type" | **fixed** |
 | F13 | `store_and_fwd_flag` read as a forward-looking value — at critical | **fixed** |
 | F14 | `group-overlap` cannot separate an entity from a non-monotonic feature | won't fix, measured |
+| F15 | 29 rows of nyc-taxi outranked the column that contains the target | **fixed** |
+
+## F15. A 29-row group spoke for the whole column
+
+Found by asking a question that should have come much earlier: nyc-taxi's
+`total_amount` *includes* the `tip_amount` being predicted, which makes it a
+genuine leak in one of the most widely used public datasets there is. The tool
+did flag it - a warning at 0.9110, 276.7 SE above chance. But ranked above it
+was `extra`, a night and rush-hour surcharge with four values, at 0.9313.
+
+```
+extra       target separation for 4.5    29 rows of 60,000 (0.05%)   0.9313
+RatecodeID  target separation for 2      177 rows (JFK flat fare)    0.9114
+total_amount  (contains the tip)                                    0.9110
+```
+
+A discrete predictor against a continuous target is scored by how well the
+target separates each of its groups, and the column took the **best single
+group**. That design was deliberate and correct for the case it was built for:
+a flag marking the top 2% of revenue scored 0.62 under Spearman and read as
+noise. But it gave any group, however small, the right to speak for the whole
+column. The effect was real - those 29 rows average a $10.94 tip against about
+$2.40 everywhere else, z = 8.0 - it was just 0.05% of the data being reported as
+though it were the answer.
+
+This is F2 again in continuous clothing, and the fix reuses the rule
+`pure-categories` already learned on riccardo, with the same constant rather
+than a new one: **a group has to cover `PURE_MIN_SHARE` of the rows to set the
+column's score, unless it separates near-perfectly.** The exception is the
+subset leak - Titanic's 121-row `body`, or a rare code marking exactly the top
+of the range - and it is admitted however small.
+
+The motivating case is untouched, and not by luck: a binary flag marking the
+top 2% separates perfectly on *both* sides, so its 98% complement carries the
+score regardless of how small the flagged side is. With at most
+`NUMERIC_CLASS_MAX` levels the largest group always holds at least 1/15 of the
+rows, so some group is always eligible.
+
+nyc-taxi now reports `total_amount` as its only predictive column. Across the
+eleven continuous-target datasets in the sweep nothing else moved. The finding
+also now names the group and its coverage - `target separation for 4.5 (29
+rows, 0.1%)` - so a reader can dismiss an artefact in a second rather than
+having to go and count.
+
+The test fixture got this wrong on its first attempt, in an instructive way:
+drawing the rare rows from the top 1% of tips made a near-perfect group, which
+the exception correctly admitted. The real group was strong but imperfect, and
+the fixture now asserts that shape before testing the rule on it.
+
+---
 
 ## F14. The identity signal cannot do what it claims — measured, not argued
 
@@ -68,11 +118,11 @@ the wrong trade for a leak detector, so the change was reverted.
 
 **Why no per-column rule can do this.** Whether grouping by a column costs you
 score depends on how redundant it is with the *other* features. `DOLocationID`
-genuinely predicts `tip_amount` by identity, but grouping by it costs −0.0012
-because `trip_distance` and `fare_amount` already carry that information. A
-rule that sees one column at a time cannot see redundancy, and this was
-already written down for that single case - six positives now show it was not
-a one-off excuse.
+genuinely predicts `tip_amount` by identity, but grouping by it costs +0.0071
+(the table above), most plausibly because `PULocationID` and `total_amount`
+already carry that information. A rule that sees one column at a time cannot
+see redundancy, and this was already written down for that single case - six
+positives now show it was not a one-off excuse.
 
 **What changed instead: the finding stopped overclaiming.** It said *"That is
 prediction by identity rather than by any relationship - the model is scoring
@@ -178,11 +228,19 @@ ordering. Measured against model-established gaps:
 | nyc-taxi (`DOLocationID`) | −0.0012 | flagged | still flagged |
 
 One measured false positive remains. `DOLocationID` has 259 levels and its
-identity does predict `tip_amount`, but grouping by it costs −0.0012 because
-that information is redundant with `trip_distance` and `fare_amount`. **No
-per-column rule can see redundancy against other features**, and the threshold
-was deliberately not tuned to hide it — that is the mistake the F2 fix has
-already made three times.
+identity does predict `tip_amount`, but grouping by it costs almost nothing -
+−0.0012 in this run and +0.0071 in the larger one under F14, both far under
+the 0.03 that counts as a gap. The likeliest reason is redundancy with other
+columns in the frame: `PULocationID`, and `total_amount`, which contains the
+fare. **No per-column rule can see redundancy against other features**, and the
+threshold was deliberately not tuned to hide it — that is the mistake the F2
+fix has already made three times.
+
+*Corrected 2026-09-11.* This paragraph originally named `trip_distance` and
+`fare_amount` as the redundant columns. Neither is in OpenML's copy of this
+dataset - the frame was never checked, and the sentence was copied forward
+into F14 as though it were measured. The redundancy argument stands; the named
+columns were wrong.
 
 **F2 was two problems wearing one name, and the first fix only closed one.**
 

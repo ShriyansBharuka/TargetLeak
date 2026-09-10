@@ -636,18 +636,39 @@ def _score_column(col, y, kind, n_features=1, n_unique=None):
         # are not derived from y, so the Hanley-McNeil null SE is valid here.
         n_vals = int(col.nunique(dropna=True)) if n_unique is None else n_unique
         if n_vals <= NUMERIC_CLASS_MAX:
-            best, best_z, best_lab = 0.5, 0.0, None
+            # A group has to COVER something to speak for the whole column,
+            # the same rule `pure-categories` learned on riccardo, with the
+            # same constant. Taking the best group unconditionally let 29 rows
+            # of 60,000 on nyc-taxi - `extra` = 4.5, averaging a $10.94 tip
+            # against about $2.40 elsewhere - score the column 0.9313 against
+            # `tip_amount`, above `total_amount` at 0.9110, which is the column
+            # that actually contains the tip. The effect was real (z = 8.0);
+            # it was just 0.05% of the data being reported as the answer.
+            #
+            # A near-perfect group is still admitted however small, because
+            # that IS the subset leak - a 121-row `body` column on Titanic.
+            # And the case this branch was built for is untouched: a binary
+            # flag marking the top 2% of revenue separates perfectly on BOTH
+            # sides, so its 98% complement carries the score regardless. With
+            # at most NUMERIC_CLASS_MAX levels the largest group always holds
+            # at least 1/15 of the rows, so some group is always eligible.
+            n_rows = int(col.notna().sum()) or 1
+            best, best_z, best_lab, best_n = 0.5, 0.0, None, 0
             for val in sorted(col.dropna().unique(), key=repr):
                 ind = (col == val).to_numpy().astype(int)
+                k = int(ind.sum())
                 sep = _separation(_auc(yy, ind))
+                if k / n_rows < PURE_MIN_SHARE and sep < AUC_CRITICAL:
+                    continue
                 if sep > best:
-                    se = _null_se(int(ind.sum()), int((ind == 0).sum()))
-                    best, best_lab = sep, val
+                    se = _null_se(k, int((ind == 0).sum()))
+                    best, best_lab, best_n = sep, val, k
                     best_z = (sep - 0.5) / se if se else 0.0
             if best_lab is None:
                 return None
             return {"score": best, "auc": None,
-                    "metric": f"target separation for {_plain(best_lab)!r}",
+                    "metric": (f"target separation for {_plain(best_lab)!r} "
+                               f"({best_n:,} rows, {best_n / n_rows:.1%})"),
                     "z": best_z, "z_min": zmin}
 
         best_r, n, best_encoded = None, 0, False
