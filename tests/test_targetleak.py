@@ -869,6 +869,38 @@ def test_a_leak_spread_across_many_target_values_is_still_found(copied_share,
     assert ("pure-categories", severity) in found, found
 
 
+def test_a_partial_copy_of_a_continuous_target_is_found_on_a_small_frame():
+    """Planted on cholesterol - 303 rows, 152 distinct target values - a
+    column equal to the target on 70% of rows was missed outright: noise on
+    the rest diluted the ranking checks, and too few rows share any one value
+    for pure-categories to form groups. Exact equality is direct evidence,
+    measured against what independence predicts."""
+    rng = np.random.default_rng(41)
+    n = 300
+    y = np.round(rng.normal(245, 50, n))
+    backfilled = np.where(rng.random(n) < 0.7, y, rng.normal(245, 60, n))
+    df = pd.DataFrame({"chol_recorded": backfilled,
+                       "age": rng.integers(30, 80, n), "y": y})
+    found = [f for f in tl.analyse(df, "y") if f.column == "chol_recorded"]
+    assert any(f.severity == "critical" and f.kind == "target-proxy"
+               and "equals the target exactly" in f.detail for f in found), \
+        [(f.severity, f.kind, f.detail[:60]) for f in found]
+
+
+def test_shared_zeros_are_not_a_copy_of_the_target():
+    """nyc-taxi's tolls_amount equals tip_amount on 15.0% of rows only because
+    both are zero on many of them. Independence predicts that coincidence, so
+    the excess over it - not the raw share - is what gets tested."""
+    rng = np.random.default_rng(42)
+    n = 20_000
+    tip = np.where(rng.random(n) < 0.15, 0.0, np.round(rng.lognormal(0.8, 0.6, n), 2))
+    tolls = np.where(rng.random(n) < 0.95, 0.0, 5.54)
+    assert (tolls == tip).mean() > 0.12, "setup: raw equality should be high"
+    df = pd.DataFrame({"tolls": tolls, "dist": rng.gamma(2, 2, n), "tip": tip})
+    assert not [f for f in tl.analyse(df, "tip")
+                if "equals the target exactly" in (f.detail or "")]
+
+
 def test_a_quantised_continuous_column_does_not_fire():
     """Improbability is not enough; a pure group has to cover something.
 

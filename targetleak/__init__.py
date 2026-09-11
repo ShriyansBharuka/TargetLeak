@@ -964,6 +964,31 @@ def _evidence_pure(col, y, limit=5):
         return None
 
 
+def _copy_excess(col, y):
+    """(observed, expected, n, matches): how often a column EQUALS a continuous
+    target, against how often independent values would coincide anyway.
+
+    Raw equality is fooled by shared values. nyc-taxi's `tolls_amount` equals
+    `tip_amount` on 15.0% of rows only because both are zero on many of them,
+    and us_crime's features match its target on up to 5.5% because every value
+    there is rounded to two decimals. Independence predicts those
+    coincidences - the sum over values of P(col = v) * P(y = v) - and after
+    subtracting it the largest of 229 real columns on continuous targets sits
+    at +0.032. A column copying the target on a fifth of its rows sits at
+    +0.19 or more.
+    """
+    both = (col.notna() & y.notna()).to_numpy()
+    if not both.any():
+        return 0.0, 0.0, 0, 0
+    c = pd.Series(np.asarray(col)[both]).astype(float)
+    t = pd.Series(np.asarray(y)[both]).astype(float)
+    matches = int((c.to_numpy() == t.to_numpy()).sum())
+    pc, pt = c.value_counts(normalize=True), t.value_counts(normalize=True)
+    common = pc.index.intersection(pt.index)
+    expected = float((pc[common] * pt[common]).sum())
+    return matches / len(c), expected, len(c), matches
+
+
 def _category_purity(col, y, n_features=1):
     """Share of rows in perfectly-pure groups, and the most damning of them.
 
@@ -1353,6 +1378,38 @@ def _column_findings(c, col, y, kind, n_features=1, varied_in_file=False):
             f"alone {strength}. Plausible for a genuinely strong feature, but "
             "confirm it exists at prediction time.",
             scored(_evidence(col, y, binary))))
+
+    # A column EQUAL to a continuous target on part of its rows - a feature
+    # backfilled with the outcome wherever the outcome was already known. The
+    # ranking checks cannot see it once noise covers the rest: planted at 70%
+    # on cholesterol (303 rows, 152 distinct values) it was missed outright,
+    # and too few rows share any one value for pure-categories to form groups
+    # of MIN_CATEGORY_SUPPORT. Exact equality is direct evidence, measured
+    # against what chance alone would produce; the admission line is the same
+    # PURE_EVIDENCE_SHARE that pure-categories uses, because it is the same
+    # quantity - the share of rows on which the column gives the answer away.
+    if kind == "continuous" and pd.api.types.is_numeric_dtype(col):
+        observed, expected, n_both, matches = _copy_excess(col, y)
+        excess = observed - expected
+        se = (expected * (1 - expected) / n_both) ** 0.5 if n_both else 0.0
+        copy_z = excess / se if se else 0.0
+        already = any(f.kind == "target-proxy" for f in findings)
+        if (not already and matches >= MIN_CATEGORY_SUPPORT
+                and excess >= PURE_EVIDENCE_SHARE and copy_z >= z_min):
+            # This says the same thing as a score-based warning on the same
+            # column, more precisely - so it replaces it rather than stacking.
+            findings = [f for f in findings
+                        if f.kind != "suspiciously-predictive"]
+            findings.append(Finding(
+                "critical" if excess >= 0.5 else "warning",
+                "target-proxy" if excess >= 0.5 else "suspiciously-predictive",
+                c,
+                f"equals the target exactly on {observed:.1%} of rows "
+                f"({matches:,} of {n_both:,}), where independent values would "
+                f"coincide on {expected:.1%}. A genuine feature does not match a "
+                "continuous target value for value on a share like that; a "
+                "column filled in from the outcome wherever the outcome was "
+                "already known does."))
 
     # Not "is this a categorical column" but "can any repeated value carry the
     # answer" - which is a question about the values, not the dtype. A numeric

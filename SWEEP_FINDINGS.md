@@ -28,6 +28,62 @@ the regression cases each entry specifies.
 | F15 | 29 rows of nyc-taxi outranked the column that contains the target | **fixed** |
 | F16 | *(benchmark)* the recall gate would have failed every week on one fixed-seed draw | **fixed** |
 | F17 | a leak spread across many target values split into groups too small to count | **fixed** |
+| F18 | a column equal to a continuous target on most rows went unreported on a small frame | **fixed** |
+
+## F18. An exact copy of the target on part of the rows, on a small frame
+
+After F17, 20 of the 34 remaining recall misses were on continuous targets.
+Sorted by cause they were two different things. Nine were noisy proxies - a
+column correlating 0.7-0.8 with the answer, which is genuinely
+indistinguishable from a good feature and is below the tool's line on
+purpose. The rest were a different shape: a column **exactly equal to the
+target on part of its rows**, the way a feature gets backfilled with the
+outcome wherever the outcome was already known. On `cholesterol` - 303 rows,
+152 distinct target values - even a 70% copy was missed: noise on the other
+rows diluted the ranking checks, and too few rows share any one value for
+F17's pure groups to reach `MIN_CATEGORY_SUPPORT`.
+
+The obvious statistic is the share of rows where the column equals the
+target. **Measured on all 229 real numeric columns against continuous targets
+in the sweep, it is fooled.** nyc-taxi's `tolls_amount` equals `tip_amount` on
+15.0% of rows only because both are zero on many of them; us_crime's features
+match its target on up to 5.5% because every value there is rounded to two
+decimals. Independence predicts those coincidences - summed over values,
+P(column = v) x P(target = v) - so the test is the **excess over
+independence**:
+
+| | equality above what chance predicts |
+|---|---:|
+| largest of all 229 real columns (us_crime `PctIlleg`) | **+0.032** |
+| planted copy at 20% coverage | +0.19 to +0.20 |
+| planted copy at 40% | +0.34 to +0.40 |
+| planted copy at 70% | +0.62 to +0.68 |
+
+Subtracting chance removes `tolls_amount` entirely. The admission line reuses
+`PURE_EVIDENCE_SHARE`, because it is the same quantity F17 measures - the
+share of rows on which the column gives the answer away - rather than a value
+picked to also catch the 20% plant, which a 229-column negative sample could
+not justify. At least `MIN_CATEGORY_SUPPORT` matching rows and a z above the
+column's multiple-testing bar are required too. It runs only against
+continuous targets, where matching the answer value for value is itself the
+evidence; against a class label, agreement is just correlation and is scored
+elsewhere.
+
+Across the 10 continuous-target datasets in the sweep it reports **zero**
+columns. When it fires it replaces the vaguer score-based warning on the same
+column rather than stacking beside it.
+
+| planted copy | cholesterol | us_crime | cpu_act |
+|---|---|---|---|
+| 70% | missed -> **critical** | critical | critical |
+| 40% | missed -> **warning** | missed -> **warning** | warning |
+| 20% | missed | missed | missed |
+
+`recall.py` over 20 datasets: 398 -> **401 of 432** (93%), 8 n/a. The target
+proxy at 70% coverage is now found on all 20 datasets and at 40% on 19. The
+continuous misses that remain are 9 noisy proxies, deliberately below the
+line, and leaks covering a fifth of the rows. Benchmark unchanged at 2/2 and
+3 false positives across 628 columns; name rules clean; 189 tests.
 
 ## F17. A leak spread thin enough slipped under every group's floor
 
