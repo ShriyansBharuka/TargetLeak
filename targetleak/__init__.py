@@ -102,6 +102,15 @@ WIDESPREAD_SHARE = 0.25
 # 46% of credit-g, or Titanic's `body` at 9%. The cost is a genuine leak
 # confined to a very small slice, which stays invisible here.
 PURE_MIN_SHARE = 0.05
+# ...or pure groups that are each significant on their own may cover this much
+# of the frame between them. A leak spread across many target values makes
+# every group small and the total large. Calibrated against the measured
+# distribution over all 23,950 real columns in the sweep, not against planted
+# leaks: the largest real non-leak sits at 19.5% (pol `f5`) and the 99.9th
+# percentile at 14.5%, while nyc-taxi's `total_amount` - which contains the
+# `tip_amount` being predicted - sits at 35.2%. A first version used 0.5,
+# borrowed from the critical line below, and would have missed that real leak.
+PURE_EVIDENCE_SHARE = 0.25
 
 
 # Finding a leak is half the job. Naming the leak without saying what to do
@@ -955,11 +964,12 @@ def _evidence_pure(col, y, limit=5):
         return None
 
 
-def _category_purity(col, y):
+def _category_purity(col, y, n_features=1):
     """Share of rows in perfectly-pure groups, and the most damning of them.
 
-    Returns `(share, n, target_value)` for the pure group least explicable by
-    chance among those covering PURE_MIN_SHARE of the rows. That last part is
+    Returns `(share, n, target_value, evidence)`: the pure group least
+    explicable by chance among those covering PURE_MIN_SHARE of the rows, and
+    the share of the frame in pure groups that are each significant alone. That last part is
     what makes the check testable: a pure group is evidence in its own right
     and its significance follows from its size against the base rate, exactly
     as for a missingness group. The share alone cannot be tested against
@@ -982,20 +992,32 @@ def _category_purity(col, y):
         ["count", "nunique", "first"])
     pure = g[(g["count"] >= MIN_CATEGORY_SUPPORT) & (g["nunique"] == 1)]
     if not len(col) or pure.empty:
-        return 0.0, 0, None
+        return 0.0, 0, None, 0.0
     share = float(pure["count"].sum() / len(col))
-    big = pure[pure["count"] >= PURE_MIN_SHARE * len(col)]
-    if big.empty:
-        # Nothing covers enough; hand back the largest so the caller's
-        # coverage gate rejects it on the same number it would have used.
-        top = pure.loc[pure["count"].idxmax()]
-        return share, int(top["count"]), top["first"]
     # log space: rate ** n underflows to 0.0 for any group worth reporting,
     # which would make every candidate compare equal.
-    rates = big["first"].map(lambda v: float((yb == v).mean()))
-    log_p = big["count"] * np.log(np.clip(rates.to_numpy(), 1e-300, None))
-    top = big.loc[log_p.idxmin()]
-    return share, int(top["count"]), top["first"]
+    rates = pure["first"].map(lambda v: float((yb == v).mean()))
+    log_p = pure["count"] * np.log(np.clip(rates.to_numpy(), 1e-300, None))
+    # Share of the frame sitting in pure groups that are EACH significant on
+    # their own - evidence that survives the per-group test, summed. A leak
+    # spread across many target values has every group small and the total
+    # large: a column equal to a continuous target on 70% of rows makes 38
+    # groups of ~1.25% each on cpu_act, every one under PURE_MIN_SHARE, 68.7%
+    # of the frame together. Riccardo's tail buckets, which the per-group
+    # floor exists to exclude, total 11.2%; no other real column in twelve
+    # datasets checked exceeds 5.5%.
+    significant = (log_p.to_numpy() + np.log(max(n_features, 1))
+                   <= np.log(0.01))
+    evidence = float(pure["count"][significant].sum() / len(col))
+    big = pure[pure["count"] >= PURE_MIN_SHARE * len(col)]
+    if big.empty:
+        # No single group covers enough. Hand back the least likely overall,
+        # so a finding admitted on `evidence` names a real group; a caller
+        # gating on coverage still rejects it on that group's size.
+        top = pure.loc[log_p.idxmin()]
+        return share, int(top["count"]), top["first"], evidence
+    top = big.loc[log_p[big.index].idxmin()]
+    return share, int(top["count"]), top["first"], evidence
 
 
 def analyse(df, target, split=None, group=None, ignore=()):
@@ -1346,7 +1368,8 @@ def _column_findings(c, col, y, kind, n_features=1, varied_in_file=False):
     # and the grouping would be pure cost.
     could_repeat = (len(col) - int(n_unique) + 1) >= MIN_CATEGORY_SUPPORT
     if could_repeat:
-        purity, pure_n, pure_val = _category_purity(col, y)
+        purity, pure_n, pure_val, evidence = _category_purity(
+            col, y, n_features)
         # This used to require `score >= AUC_WARN`, which gated the check
         # behind the very dilution it exists to see past. A reason code filled
         # in only for one outcome, with a catch-all default for everything
@@ -1364,8 +1387,14 @@ def _column_findings(c, col, y, kind, n_features=1, varied_in_file=False):
             rate = float((pd.Series(np.asarray(y)) == pure_val).mean())
             p_null = rate ** pure_n
         covers = pure_n / len(col) if len(col) else 0.0
-        if (pure_n and covers >= PURE_MIN_SHARE
-                and p_null * max(n_features, 1) <= 0.01):
+        # Admitted either way: one pure group big enough to matter, or
+        # individually significant pure groups that together cover
+        # PURE_EVIDENCE_SHARE of the frame. Severity is still set below by the
+        # aggregate share, so a leak spread thinly across a quarter to a half
+        # of the rows reads as a warning to confirm, and one partitioning most
+        # of the frame reads critical.
+        if pure_n and p_null * max(n_features, 1) <= 0.01 and (
+                covers >= PURE_MIN_SHARE or evidence >= PURE_EVIDENCE_SHARE):
             # Two gates, two different jobs: the p-value says this is not
             # chance, PURE_MIN_SHARE says it is not a rounding artefact. Then
             # the aggregate share decides how loud - values partitioning most

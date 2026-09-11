@@ -846,6 +846,29 @@ def test_a_numeric_column_with_pure_sub_populations_is_found():
             and f.column == "refund_amount"], [(f.kind, f.column) for f in out]
 
 
+@pytest.mark.parametrize("copied_share,severity", [(0.7, "critical"),
+                                                   (0.4, "warning")])
+def test_a_leak_spread_across_many_target_values_is_still_found(copied_share,
+                                                                severity):
+    """A column equal to a continuous target on part of the rows. Every value
+    it copies becomes its own pure group, so the leak splits into dozens of
+    groups of ~1.25% - each one under PURE_MIN_SHARE, 68.7% of the frame
+    together at 70% coverage. Measured on cpu_act, where it went unreported:
+    noise on the rest dragged its Spearman to 0.64, and every group failed
+    the coverage floor on its own. Significant pure groups are now summed and
+    admitted at PURE_EVIDENCE_SHARE; the aggregate still sets severity, so
+    most of the frame reads critical and a quarter to a half reads warning."""
+    rng = np.random.default_rng(31)
+    n = 8000
+    y = rng.choice(np.arange(40, 100), n)           # tied, like cpu_act's usr
+    copied = rng.random(n) < copied_share
+    leak = np.where(copied, y.astype(float), rng.normal(70, 25, n))
+    df = pd.DataFrame({"leak": leak, "x": rng.normal(size=n), "y": y})
+    found = {(f.kind, f.severity) for f in tl.analyse(df, "y")
+             if f.column == "leak"}
+    assert ("pure-categories", severity) in found, found
+
+
 def test_a_quantised_continuous_column_does_not_fire():
     """Improbability is not enough; a pure group has to cover something.
 

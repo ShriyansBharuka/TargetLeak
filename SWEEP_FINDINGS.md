@@ -27,6 +27,60 @@ the regression cases each entry specifies.
 | F14 | `group-overlap` cannot separate an entity from a non-monotonic feature | won't fix, measured |
 | F15 | 29 rows of nyc-taxi outranked the column that contains the target | **fixed** |
 | F16 | *(benchmark)* the recall gate would have failed every week on one fixed-seed draw | **fixed** |
+| F17 | a leak spread across many target values split into groups too small to count | **fixed** |
+
+## F17. A leak spread thin enough slipped under every group's floor
+
+`recall.py` missed a planted proxy on `cpu_act` at 70% coverage: a column
+**exactly equal to the target on 70% of rows**, unreported. Its Spearman was
+0.64, diluted by the noise on the other 30%, and `pure-categories` - which
+catches the same shape against a classification target - never fired.
+
+The reason was the coverage floor doing its job one group at a time. Every
+target value the column copies becomes its own pure group, and `cpu_act`'s
+target has 56 distinct values, so the leak split into 38 significant groups
+of about 1.25% each. Every one of them failed `PURE_MIN_SHARE`, while together
+they covered **68.7% of the frame**. The floor exists because of riccardo,
+whose quantised features make thousands of genuinely-pure tail buckets; the
+question was whether the *sum* of significant pure groups separates the two.
+
+**The first answer was wrong, and the measurement that corrected it is the
+useful part.** Comparing each dataset's worst column suggested a wide gap -
+planted leaks at 38-99%, riccardo at 11.2% - and the rule went in at 0.5,
+borrowed from the line `pure-categories` already draws between critical and
+warning. Before committing, the full distribution over all **23,950 real
+columns** in the sweep was measured instead:
+
+| real column with no single group over 5% | evidence share |
+|---|---:|
+| nyc-taxi `total_amount` - contains the tip being predicted | **35.2%** |
+| pol `f5` | 19.5% |
+| shuttle `A7` | 14.5% |
+| 99.9th percentile of all 23,950 | 14.5% |
+| riccardo, the tail buckets the floor exists for | 10-11% |
+
+At 0.5, the one real-world leak this rule could reach would have been missed.
+The cut-off now sits at **`PURE_EVIDENCE_SHARE = 0.25`**, between the largest
+real non-leak and the real leak, with that measurement written beside the
+constant. Across the whole sweep it admits exactly one column that nothing
+else caught - `total_amount` - and it is a true positive: its values determine
+the tip exactly on 35% of rows, the arithmetic containment showing up directly
+in the data.
+
+Severity still follows the aggregate share, so nothing changed about what
+reads critical:
+
+| planted proxy on `cpu_act` | before | after |
+|---|---|---|
+| 100% coverage | critical | critical |
+| 70% | **missed** | critical |
+| 40% | **missed** | warning |
+| 20% | missed | missed - 18.6% evidence, below the line |
+
+Benchmark unchanged at 2/2 and 3 false positives across 628 columns; 187 tests.
+`recall.py` over 20 datasets: 393 -> **398 of 432** planted leaks found, 8 n/a,
+the gain entirely in partial-coverage target proxies and reason codes, and the
+only control alarm the isolated `anneal` draw recorded under F16.
 
 ## F16. The weekly gate would have failed forever on one unlucky draw
 

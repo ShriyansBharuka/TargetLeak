@@ -36,7 +36,7 @@ Three things worth knowing before you rely on it:
   missed** - pandas 3 string dtypes, NaN targets being read as the negative
   class, an integer-cardinality cliff, and a leak covering only 121 rows. A
   sweep across ~100 more, plus the recall and name-rule benchmarks below,
-  have since found **seventeen** further problems in the tool - fifteen
+  have since found **eighteen** further problems in the tool - sixteen
   fixed, two measured and documented as limits, each with its reproduction in
   [`SWEEP_FINDINGS.md`](SWEEP_FINDINGS.md). Yours may still be the one that
   breaks it, but it is no longer the first hard one.
@@ -44,7 +44,7 @@ Three things worth knowing before you rely on it:
   below). Expect a little noise and expect to suppress the odd column.
 - **A clean report is not proof of absence.** It cannot tell a leak from a
   genuinely easy problem - see the benchmark, where that limitation is
-  measured rather than hidden. What it *can* tell you is measured too: **91%**
+  measured rather than hidden. What it *can* tell you is measured too: **92%**
   of planted leaks across four column families and three split shapes over 20
   datasets, and 20/20 when the leak is a clean copy of the answer.
 
@@ -234,8 +234,8 @@ python benchmark/recall.py
 
 | planted leak | full strength | covering 70% | 40% | 20% |
 |---|---|---|---|---|
-| target proxy computed from the answer | **20/20** | 17/20 | 15/20 | 14/20 |
-| reason code filled in from the outcome | **19/19** | 19/19 | 17/19 | 14/19 |
+| target proxy computed from the answer | **20/20** | 19/20 | 17/20 | 14/20 |
+| reason code filled in from the outcome | **19/19** | 19/19 | 18/19 | 14/19 |
 | measurement never taken when it happened | **19/19** | 19/19 | 19/19 | 17/19 |
 | the answer plus noise | 19/20 | 18/20 | 16/20 | 11/20 |
 
@@ -249,12 +249,12 @@ unlabelled data exercises them:
 | an entity whose identity predicts the target | 20/20 | 20/20 at 60% | |
 | a real date column under a random split | 20/20 | | |
 
-**393 of 432 planted leaks found (91%) across 20 real datasets**, with 8
+**398 of 432 planted leaks found (92%) across 20 real datasets**, with 8
 scenarios reported `n/a` because the dataset cannot host that leak at all — a
 NaN pattern is one bit and cannot give away a 100-class label, so demanding
 that it does would measure nothing.
 
-**That 91% replaces a 98%, and the drop is the honest part.** The old number
+**That 92% replaces a 98%, and the drop is the honest part.** The old number
 came from six datasets that were all modest binary tables, so it said nothing
 about a continuous target, a 100-class one, or a frame that is mostly missing.
 Expanding to 20 also exposed a bug in this benchmark: the planters keyed off
@@ -263,9 +263,9 @@ meant planting a column keyed to **6 rows out of 303** and then asking the tool
 to find a leak that was not there.
 
 Where the misses sit matters more than the total. **A clean copy of the answer
-is found 20/20, a reason code 19/19, a missingness leak 19/19.** Of the 39
-misses, **25 are on the three continuous targets** and 10 are partial-coverage
-leaks against 26 and 100 classes. Those are the genuine weak spots, and the
+is found 20/20, a reason code 19/19, a missingness leak 19/19.** Of the 34
+misses, **20 are on the three continuous targets** and 11 are partial-coverage
+leaks against 4 to 100 classes. Those are the genuine weak spots, and the
 benchmark prints every one of them by name each time it runs.
 
 The noisy-proxy row was itself wrong until this run. Its strength was set by
