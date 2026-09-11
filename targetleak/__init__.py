@@ -1021,7 +1021,16 @@ def _category_purity(col, y, n_features=1):
     share = float(pure["count"].sum() / len(col))
     # log space: rate ** n underflows to 0.0 for any group worth reporting,
     # which would make every candidate compare equal.
-    rates = pure["first"].map(lambda v: float((yb == v).mean()))
+    #
+    # Base rates from one count of the target, not one comparison per group.
+    # `(yb == v).mean()` per group is a full pass over the column each time,
+    # and on riccardo - dozens of pure tail buckets in each of 4,283 columns -
+    # that was 225,346 passes over 20,000 rows, 91 of 257 profiled seconds,
+    # added when F17 began scoring every pure group instead of only the large
+    # ones. Counts over the full length give the identical rate, NaN included
+    # in the denominator exactly as the comparison had it.
+    counts = yb.value_counts(dropna=True)
+    rates = pure["first"].map(counts).fillna(0).astype(float) / len(yb)
     log_p = pure["count"] * np.log(np.clip(rates.to_numpy(), 1e-300, None))
     # Share of the frame sitting in pure groups that are EACH significant on
     # their own - evidence that survives the per-group test, summed. A leak

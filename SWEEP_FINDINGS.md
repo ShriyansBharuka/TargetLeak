@@ -29,6 +29,32 @@ the regression cases each entry specifies.
 | F16 | *(benchmark)* the recall gate would have failed every week on one fixed-seed draw | **fixed** |
 | F17 | a leak spread across many target values split into groups too small to count | **fixed** |
 | F18 | a column equal to a continuous target on most rows went unreported on a small frame | **fixed** |
+| F19 | F17 made the purity check scan the whole target once per pure group | **fixed** |
+
+## F19. F17 slowed the widest frames, and the sweep caught it
+
+The full sweep, run after F17 and F18, put `riccardo` back on the slow list
+and `covertype` up from 67.3s to 81.2s. Profiling riccardo pointed at one
+line F17 had widened: each pure group's base rate was computed as
+`(y == v).mean()`, a full pass over the target. F17 began scoring *every*
+pure group rather than only the large ones, and riccardo has dozens of pure
+tail buckets in each of 4,283 columns - **225,346 passes over 20,000 rows**,
+91 of 257 profiled seconds.
+
+The fix counts the target once and looks each rate up. It is the same
+quantity - count over full length, with NaN in the denominator exactly as the
+comparison had it - so it was proven rather than assumed to change nothing:
+every finding on nine datasets captured before and after, **606 findings,
+byte-identical**, plus the rates themselves asserted equal over 21,667 pure
+groups.
+
+The speed-up quoted is the controlled one. Whole-run timings moved 3-5x on
+*every* dataset, including ones where this code barely runs, because the
+machine itself sped up between the two runs - so those numbers say more about
+the laptop than the change. Timed side by side in one process, alternating,
+best of three: **the base-rate step went from 0.94s to 0.13s, 7x**, on 400 of
+riccardo's columns. With that step at about 35% of riccardo's profile, the
+whole-run gain there is roughly a third.
 
 ## F18. An exact copy of the target on part of the rows, on a small frame
 

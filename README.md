@@ -36,7 +36,7 @@ Three things worth knowing before you rely on it:
   missed** - pandas 3 string dtypes, NaN targets being read as the negative
   class, an integer-cardinality cliff, and a leak covering only 121 rows. A
   sweep across ~100 more, plus the recall and name-rule benchmarks below,
-  have since found **nineteen** further problems in the tool - seventeen
+  have since found **twenty** further problems in the tool - eighteen
   fixed, two measured and documented as limits, each with its reproduction in
   [`SWEEP_FINDINGS.md`](SWEEP_FINDINGS.md). Yours may still be the one that
   breaks it, but it is no longer the first hard one.
