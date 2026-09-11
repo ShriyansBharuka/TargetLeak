@@ -30,6 +30,35 @@ the regression cases each entry specifies.
 | F17 | a leak spread across many target values split into groups too small to count | **fixed** |
 | F18 | a column equal to a continuous target on most rows went unreported on a small frame | **fixed** |
 | F19 | F17 made the purity check scan the whole target once per pure group | **fixed** |
+| F20 | a multiclass target redid class-independent work once per class | **fixed** |
+
+## F20. Seven classes, seven times the same work
+
+`covertype` stayed on the sweep's slow list after F19. Profiling a 150,000-row
+sample found no hotspot - the time was in the two steps the tool cannot do
+without, out-of-fold encoding and rank AUC - but the call counts showed the
+waste: **378 encodings for 54 columns**, one per column per class. A
+one-vs-rest target scores every column once per class, and most of that work
+does not depend on the class at all: the factorised codes, the fold
+assignment, each fold's group counts, and the ranking of the raw column. Only
+the per-class *sums* change.
+
+Those are now built once per column (`_encode_plan`, `_ranked`) and reused
+across classes. The arithmetic is unchanged - the same codes, folds and counts
+feeding the same expressions - and it was proven rather than assumed: all 606
+findings on the nine-dataset baseline, **byte-identical**, and 189 tests.
+
+Timed against the committed version loaded side by side in one process,
+alternating, best of three:
+
+| dataset | classes | before | after | |
+|---|---:|---:|---:|---:|
+| covertype, 150k rows | 7 | 20.7s | 15.2s | 1.36x |
+| letter | 26 | 2.3s | 1.6s | 1.46x |
+| one-hundred-plants-margin | 100 | 7.5s | 4.1s | 1.84x |
+
+The gain grows with the class count, which is the check that it is the reuse
+doing it. Binary and continuous targets do the same work as before.
 
 ## F19. F17 slowed the widest frames, and the sweep caught it
 

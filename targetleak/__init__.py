@@ -277,7 +277,16 @@ class Finding:
         return f"{self.severity.upper():8} {self.kind}{where}: {self.detail}"
 
 
-def _auc(scores, y):
+def _ranked(scores):
+    """(present-mask, average ranks of the present values) - the part of an
+    AUC that depends only on the scores, so it can be computed once and reused
+    against every class of a multiclass target."""
+    s = pd.Series(scores)
+    ok = s.notna()
+    return ok.to_numpy(), s[ok].rank(method="average").to_numpy()
+
+
+def _auc(scores, y, ranked=None):
     """True rank AUC (Mann-Whitney U), tie-corrected, in [0, 1].
 
     Returns the AUC as measured, NOT max(auc, 1-auc). An earlier version
@@ -285,15 +294,17 @@ def _auc(scores, y):
     "AUC 1.0000" when its actual AUC was 0.0000 - a number the user could not
     reconcile with their own metrics. Direction is handled by the caller via
     `_separation`, which is what thresholds are applied to.
+
+    `ranked`, from `_ranked(scores)`, skips re-ranking identical scores. A
+    multiclass target asks for the raw column's AUC once per class, and the
+    ranking never depends on the class.
     """
-    s = pd.Series(scores)
-    ok = s.notna()
-    s, yy = s[ok], np.asarray(y)[ok.to_numpy()]
+    ok, ranks = _ranked(scores) if ranked is None else ranked
+    yy = np.asarray(y)[ok]
     n1 = int((yy == 1).sum())
     n0 = int((yy == 0).sum())
-    if n1 == 0 or n0 == 0 or len(s) == 0:
+    if n1 == 0 or n0 == 0 or len(ranks) == 0:
         return 0.5
-    ranks = s.rank(method="average").to_numpy()
     return float((ranks[yy == 1].sum() - n1 * (n1 + 1) / 2) / (n1 * n0))
 
 
@@ -442,7 +453,30 @@ def _target_kind(y):
     return "unsupported"
 
 
-def _oof_target_encode(col, y, folds=FOLDS, seed=0):
+def _encode_plan(col, folds=FOLDS, seed=0):
+    """Everything about an out-of-fold encoding that does not depend on the
+    target: the codes, the fold assignment, and each fold's group counts.
+
+    A multiclass target encodes every column once per class, and only the
+    SUMS of the indicator change between classes. Building this once per
+    column instead of once per class was measured on covertype, 7 classes:
+    378 encodings where 54 would do.
+    """
+    rng = np.random.default_rng(seed)
+    fold = rng.permutation(len(col)) % folds
+    codes, _ = pd.factorize(col, use_na_sentinel=True)
+    ncat = int(codes.max()) + 1 if len(codes) else 0
+    known = codes >= 0
+    kc, kf = codes[known], fold[known]
+    tot_cnt = np.bincount(kc, minlength=ncat).astype(float) if ncat else None
+    f_cnt = ([np.bincount(kc[kf == f], minlength=ncat).astype(float)
+              for f in range(folds)] if ncat else [])
+    return {"folds": folds, "fold": fold, "codes": codes, "ncat": ncat,
+            "known": known, "kc": kc, "kf": kf,
+            "tot_cnt": tot_cnt, "f_cnt": f_cnt}
+
+
+def _oof_target_encode(col, y, folds=FOLDS, seed=0, plan=None):
     """Target-encode a categorical using only out-of-fold means.
 
     In-fold encoding leaks the target into its own score, which would make
@@ -451,16 +485,15 @@ def _oof_target_encode(col, y, folds=FOLDS, seed=0):
 
     Factorised once up front, so the fold loop groups integer codes instead of
     Python objects. pandas' own group_mean still does the summing, so the
-    floats are bit-identical to grouping the values themselves.
+    floats are bit-identical to grouping the values themselves. `plan` from
+    `_encode_plan` supplies the target-independent part pre-built.
     """
+    p = _encode_plan(col, folds, seed) if plan is None else plan
+    folds, fold, codes = p["folds"], p["fold"], p["codes"]
+    ncat, known = p["ncat"], p["known"]
     yv = np.asarray(y, dtype=float)
-    rng = np.random.default_rng(seed)
-    fold = rng.permutation(len(col)) % folds
-    codes, _ = pd.factorize(col, use_na_sentinel=True)
-    ncat = int(codes.max()) + 1 if len(codes) else 0
     out = np.full(len(col), np.nan)
     ys = pd.Series(yv)
-    known = codes >= 0
 
     # A one-vs-rest target is a 0/1 indicator, and a multiclass frame asks for
     # one encoding per class per column - 856 columns x 9 classes x 5 folds was
@@ -475,15 +508,13 @@ def _oof_target_encode(col, y, folds=FOLDS, seed=0):
     # keeps the groupby path below.
     finite = yv[np.isfinite(yv)]
     if ncat and len(finite) and np.array_equal(finite, finite.astype(bool)):
-        kc, ky = codes[known], yv[known]
-        kf = fold[known]
+        kc, kf, ky = p["kc"], p["kf"], yv[known]
         tot_sum = np.bincount(kc, weights=ky, minlength=ncat)
-        tot_cnt = np.bincount(kc, minlength=ncat).astype(float)
+        tot_cnt = p["tot_cnt"]
         for f in range(folds):
             sel = kf == f
             f_sum = np.bincount(kc[sel], weights=ky[sel], minlength=ncat)
-            f_cnt = np.bincount(kc[sel], minlength=ncat).astype(float)
-            n_tr = tot_cnt - f_cnt
+            n_tr = tot_cnt - p["f_cnt"][f]
             with np.errstate(invalid="ignore", divide="ignore"):
                 lut = np.where(n_tr > 0, (tot_sum - f_sum) / n_tr, np.nan)
             te = known & (fold == f)
@@ -513,6 +544,21 @@ def _score_column(col, y, kind, n_features=1, n_unique=None):
     if (col.nunique(dropna=True) if n_unique is None else n_unique) < 2:
         return None
     zmin = _z_min(n_features)
+    # Target-independent work, done once per column rather than once per
+    # class: a 7-class target otherwise re-ranks the raw column and rebuilds
+    # the same folds and group counts seven times. Built lazily, since a
+    # continuous target or an all-distinct column may never need them.
+    cache = {}
+
+    def plan():
+        if "plan" not in cache:
+            cache["plan"] = _encode_plan(col)
+        return cache["plan"]
+
+    def raw_ranked():
+        if "ranked" not in cache:
+            cache["ranked"] = _ranked(col)
+        return cache["ranked"]
 
     def candidates(target_vec):
         """Score vectors worth trying for this column.
@@ -545,8 +591,8 @@ def _score_column(col, y, kind, n_features=1, n_unique=None):
         # warning from the other. The last of the storage-vs-content bugs.
         n_vals = int(col.nunique(dropna=True)) if n_unique is None else n_unique
         if n_vals * 2 <= len(col):
-            out.append((_oof_target_encode(col, target_vec), True))
-        return out or [(_oof_target_encode(col, target_vec), True)]
+            out.append((_oof_target_encode(col, target_vec, plan=plan()), True))
+        return out or [(_oof_target_encode(col, target_vec, plan=plan()), True)]
 
     def measure(target_ind):
         """Best AUC over the candidate encodings, with the null SE computed
@@ -560,9 +606,13 @@ def _score_column(col, y, kind, n_features=1, n_unique=None):
         best_auc, best_sep, best_se = 0.5, 0.5, float("inf")
         best_encoded = False
         for scores, encoded in candidates(target_ind):
-            ok = pd.Series(scores).notna().to_numpy()
+            # The raw column is the same vector for every class, so its
+            # ranking is reused; an encoding differs per class and is ranked
+            # fresh. `scores is col` is exact - candidates appends col itself.
+            ranked = raw_ranked() if scores is col else _ranked(scores)
+            ok = ranked[0]
             used = np.asarray(target_ind)[ok]
-            auc = _auc(scores, target_ind)
+            auc = _auc(scores, target_ind, ranked=ranked)
             sep = _separation(auc)
             if sep >= best_sep:
                 best_auc, best_sep, best_encoded = auc, sep, encoded
@@ -579,7 +629,8 @@ def _score_column(col, y, kind, n_features=1, n_unique=None):
 
             def null_score(i):
                 perm = np.random.default_rng(i).permutation(ind)
-                return _separation(_auc(_oof_target_encode(col, perm), perm))
+                return _separation(_auc(
+                    _oof_target_encode(col, perm, plan=plan()), perm))
 
             z = _empirical_z(best_sep, null_score)
         return best_auc, best_sep, z
